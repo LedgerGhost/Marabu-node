@@ -1,6 +1,7 @@
 import { hash, objectManager } from './objectmanager'
 import { validate as validateTx } from './tx'
 import { type MarabuBlockObject, type MarabuTxObject, type MarabuError } from './net/protocol'
+import { type CoinbaseTransaction, type RegularTransaction, isCoinbase as isCoinbaseTx } from './objects'
 import { UTXOSet, loadUTXO } from './utxo'
 import { log } from './log'
 
@@ -16,8 +17,8 @@ function fail(error: MarabuError, description: string): BlockValidationResult {
   return { valid: false, error, description }
 }
 
-function isCoinbase(tx: MarabuTxObject): boolean {
-  return tx.height !== undefined && tx.inputs === undefined
+function isCoinbase(tx: MarabuTxObject): tx is CoinbaseTransaction {
+  return isCoinbaseTx(tx)
 }
 
 function satisfiesPoW(blockid: string, target: string): boolean {
@@ -66,7 +67,7 @@ export async function validateBlock(
   }
 
   // Coinbase position
-  let coinbaseTx: MarabuTxObject | null = null
+  let coinbaseTx: CoinbaseTransaction | null = null
   let coinbaseTxid: string | null = null
   let coinbaseCount = 0
 
@@ -79,7 +80,7 @@ export async function validateBlock(
           `Coinbase transaction must be at index 0 in txids, found at index ${i}`
         )
       }
-      coinbaseTx = transactions[i]!.tx
+      coinbaseTx = transactions[i]!.tx as CoinbaseTransaction
       coinbaseTxid = transactions[i]!.txid
     }
   }
@@ -93,8 +94,7 @@ export async function validateBlock(
     if (coinbaseTx.outputs.length !== 1) {
       return fail('INVALID_FORMAT', `Coinbase must have exactly 1 output, has ${coinbaseTx.outputs.length}`)
     }
-    if (coinbaseTx.height === undefined
-      || typeof coinbaseTx.height !== 'number'
+    if (typeof coinbaseTx.height !== 'number'
       || !Number.isInteger(coinbaseTx.height)
       || coinbaseTx.height < 0) {
       return fail('INVALID_FORMAT', `Coinbase has invalid height`)
@@ -113,8 +113,9 @@ export async function validateBlock(
   if (coinbaseTxid !== null) {
     for (const { tx } of transactions) {
       if (isCoinbase(tx)) continue
-      if (tx.inputs === undefined) continue
-      for (const input of tx.inputs) {
+      const regularTx = tx as RegularTransaction
+      if (regularTx.inputs === undefined) continue
+      for (const input of regularTx.inputs) {
         if (input.outpoint.txid === coinbaseTxid) {
           return fail(
             'INVALID_TX_OUTPOINT',
@@ -141,12 +142,13 @@ export async function validateBlock(
       continue
     }
 
-    if (tx.inputs === undefined) {
+    const regularTx = tx as RegularTransaction
+    if (regularTx.inputs === undefined) {
       return fail('INVALID_FORMAT', `Non-coinbase transaction ${txid} has no inputs`)
     }
 
     let inputSum = 0
-    for (const input of tx.inputs) {
+    for (const input of regularTx.inputs) {
       const utxoEntry = utxoSet.get(input.outpoint.txid, input.outpoint.index)
       if (utxoEntry === undefined) {
         return fail(
@@ -168,7 +170,7 @@ export async function validateBlock(
     }
     totalFees += (inputSum - outputSum)
 
-    for (const input of tx.inputs) {
+    for (const input of regularTx.inputs) {
       utxoSet.remove(input.outpoint.txid, input.outpoint.index)
     }
     for (let j = 0; j < tx.outputs.length; j++) {

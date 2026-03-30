@@ -101,3 +101,16 @@ const MessageSchemas = [
 
 export const MessageSchema = z.discriminatedUnion('type', MessageSchemas)
 export type Message = z.infer<typeof MessageSchema>
+
+// Re-export application-object types under the names used across the codebase
+import {
+  ApplicationObjectSchema,
+  type ApplicationObject,
+  type Block,
+  type Transaction
+} from '../objects'
+
+export const MarabuObjectSchema = ApplicationObjectSchema
+export type MarabuObject = ApplicationObject
+export type MarabuBlockObject = Block
+export type MarabuTxObject = Transaction
