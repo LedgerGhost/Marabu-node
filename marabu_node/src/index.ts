@@ -13,7 +13,6 @@ if (typeof globalThis.Bun !== 'undefined') {
   }
 }
 
-// Prevent unhandled errors from crashing the node
 process.on('uncaughtException', (err) => {
   log.error(`Uncaught exception: ${err.message}`)
   log.error(err.stack || '')

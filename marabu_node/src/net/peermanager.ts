@@ -1,4 +1,3 @@
-import type { Peer } from './peer'
 import { MarabuPeer } from './marabupeer'
 import { log } from '../log'
 import conf from '../conf'
@@ -7,32 +6,33 @@ import net from 'net'
 import * as fs from 'fs'
 import canonicalize from 'canonicalize'
 import * as z from 'zod'
-import type { ObjectDB } from '../store'
 
 export class PeerManager {
   // connections contains all peers which I am currently connected to,
   // or those I am attempting a connection to
-  connections: Set<Peer> = new Set<Peer>()
+  connections: Set<MarabuPeer> = new Set<MarabuPeer>()
   knownPeerAddrs = new Set<string>()
   myPublicHost: string
-  objectDB: ObjectDB
+  private objectWaiters = new Map<string, ((oid: string, obj: any) => void)[]>()
 
-  constructor(myPublicHost: string, objectDB: ObjectDB) {
+  constructor(myPublicHost: string) {
     this.myPublicHost = myPublicHost
-    this.objectDB = objectDB
   }
-  // Broadcast a message to all connected peers except the excluded one.
-  broadcast(message: object, exclude?: Peer) {
-    for (const connection of this.connections) {
-      if (connection === exclude) continue
-      if (!(connection instanceof MarabuPeer)) continue
-      if (!connection.handshook) continue
-      try {
-        connection.sendMessage(message)
+  registerObjectWaiter(objectid: string, handler: (oid: string, obj: any) => void) {
+    const existing = this.objectWaiters.get(objectid) || []
+    existing.push(handler)
+    this.objectWaiters.set(objectid, existing)
+  }
+  removeObjectWaiter(objectid: string) {
+    this.objectWaiters.delete(objectid)
+  }
+  notifyObjectWaiters(objectid: string, obj: any) {
+    const waiters = this.objectWaiters.get(objectid)
+    if (waiters && waiters.length > 0) {
+      for (const handler of waiters) {
+        try { handler(objectid, obj) } catch { }
       }
-      catch (e: any) {
-        log.warn(`Failed to broadcast to peer: ${e.message}`)
-      }
+      this.objectWaiters.delete(objectid)
     }
   }
   getKnownPeerAddrs(): string[] {
@@ -81,10 +81,10 @@ export class PeerManager {
     }
     await this.connectSufficiently()
   }
-  addConnection(peer: Peer) {
+  addConnection(peer: MarabuPeer) {
     this.connections.add(peer)
   }
-  async removeConnection(peer: Peer) {
+  async removeConnection(peer: MarabuPeer) {
     this.connections.delete(peer)
     await this.connectSufficiently()
   }

@@ -3,7 +3,7 @@ import * as z from 'zod'
 const ConfigSchema = z.object({
   SERVER_HOST: z.string().default('0.0.0.0'),
   SERVER_PORT: z.coerce.number().default(18018),
-  AGENT_NAME: z.string().trim().max(128).default('LedgerGhost(pset2)'),
+  AGENT_NAME: z.string().trim().max(128).default('LedgerGhost(pset3)'),
   AGENT_VERSION: z.string().default('1.0.0'),
   AGENT_AUTHOR: z.string().default('Stergiou Konstantinos <kstergiou987@gmail.com>'),
 

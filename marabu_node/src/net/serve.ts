@@ -3,8 +3,8 @@ import { MarabuPeer } from './marabupeer'
 import conf from '../conf'
 import { log } from '../log'
 import { PeerManager } from './peermanager'
-import { ObjectDB } from '../store'
-import { objectId } from '../crypto'
+import { hash, objectManager } from '../objectmanager'
+import { UTXOSet, saveUTXO, hasUTXO } from '../utxo'
 
 const GENESIS_BLOCK = {
   T: '00000000abc00000000000000000000000000000000000000000000000000000',
@@ -17,38 +17,36 @@ const GENESIS_BLOCK = {
   type: 'block'
 }
 const GENESIS_BLOCKID = '00000000522473196b73bc619a8b18472c4cb4c6caf785a13fa32aaae7222ff6'
-//db init
-export async function run() {
-  const objectDB = new ObjectDB('./objectdb')
-  await objectDB.open()
 
-  const genesisId = objectId(GENESIS_BLOCK)
+export async function run() {
+  const genesisId = hash(GENESIS_BLOCK)
   if (genesisId !== GENESIS_BLOCKID) {
-    throw new Error(
-      `Genesis block hash mismatch! Got ${genesisId}, expected ${GENESIS_BLOCKID}. ` +
-      `Check your canonical JSON implementation.`
-    )
+    throw new Error(`Genesis hash mismatch! Got ${genesisId}, expected ${GENESIS_BLOCKID}`)
   }
   log.info(`Genesis block hash verified: ${genesisId}`)
 
-  if (!(await objectDB.has(GENESIS_BLOCKID))) {
-    await objectDB.put(GENESIS_BLOCK)
+  if (!await objectManager.has(GENESIS_BLOCKID)) {
+    await objectManager.put(GENESIS_BLOCK)
     log.info('Stored genesis block in object database')
   }
 
-  // Discover pIP
+  if (!await hasUTXO(GENESIS_BLOCKID)) {
+    await saveUTXO(GENESIS_BLOCKID, new UTXOSet())
+    log.info('Initialized empty UTXO set for genesis block')
+  }
+
   let myPublicIP: string | undefined
+
   try {
     const resp = await fetch(conf.IP_RETRIEVAL_SERVICE)
     myPublicIP = await resp.text()
     log.info(`Discovered self public IP: ${myPublicIP}`)
-  }
-  catch (e: any) {
-    log.warn(`Failed to discover public IP: ${e.message}. Using 0.0.0.0 as fallback.`)
+  } catch (e: any) {
+    log.warn(`Failed to discover public IP: ${e.message}. Using 0.0.0.0`)
     myPublicIP = '0.0.0.0'
   }
 
-  let peerManager = new PeerManager(myPublicIP, objectDB)
+  let peerManager = new PeerManager(myPublicIP)
   await peerManager.restore()
 
   const server = createServer(socket => {

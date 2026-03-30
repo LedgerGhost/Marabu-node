@@ -6,14 +6,14 @@ import {
   type ErrorMessage,
   type GetPeersMessage,
   type PeersMessage,
-  type GetObjectMessage,
   type IHaveObjectMessage,
+  type GetObjectMessage,
   type ObjectMessage,
-  type GetMempoolMessage,
-  type MempoolMessage,
-  type GetChainTipMessage,
-  type ChainTipMessage,
-  type MarabuError
+  type MarabuError,
+  type MarabuObject,
+  type MarabuBlockObject,
+  type MarabuTxObject,
+  MarabuObjectSchema
 } from './protocol'
 import * as z from 'zod'
 import * as semver from 'semver'
@@ -21,17 +21,17 @@ import { Socket } from 'net'
 import type { PeerManager } from './peermanager'
 import { log } from '../log'
 import canonicalize from 'canonicalize'
-import { objectId } from '../crypto'
-import { parseApplicationObject, type Transaction } from '../objects'
-import { validateTransaction } from '../validation'
+import { hash, validateObject, objectManager } from '../objectmanager'
+import { validateBlock, isCoinbase } from '../block'
+import { saveUTXO } from '../utxo'
 
 const PROTOCOL_VERSION = '0.10.0'
 const PROTOCOL_COMPATIBLE_VERSIONS = '0.10.x'
 
-type MessageHandler = (this: MarabuPeer, message: any) => void | Promise<void>
+type MessageHandler<T> = (this: MarabuPeer, message: T) => Promise<void>
 // holds a list of methods that handle protocol messages,
 // one for each message type, for dispatching purposes
-const handlers = new Map<string, MessageHandler>()
+const handlers = new Map<Message["type"], MessageHandler<Message>>()
 
 export class MarabuPeer extends Peer {
   handshook = false
@@ -47,18 +47,15 @@ export class MarabuPeer extends Peer {
     else {
       socket.on('connect', () => this.onConnect())
     }
+    // handle internal socket errors by closing the connection and without informing peer
     socket.on('error', err => {
-      this.log.warn(`Socket error: ${err}`)
-      this.peerManager.removeConnection(this)
+      this.error(`Socket produced error: ${err}`, 'INTERNAL_ERROR', false)
     })
     socket.on('timeout', () => {
-      this.log.warn(`Socket timed out`)
-      this.socket.end()
-      this.peerManager.removeConnection(this)
+      this.error(`Socket timed out`, 'INTERNAL_ERROR', false)
     })
-    socket.on('close', () => {
-      this.log.info(`Connection closed`)
-      this.peerManager.removeConnection(this)
+    socket.on('finish', () => {
+      this.error(`Socket finished`, 'INTERNAL_ERROR', false)
     })
   }
   onConnect() {
@@ -71,15 +68,16 @@ export class MarabuPeer extends Peer {
     try {
       parsedMessage = MessageSchema.parse(message)
     }
-    catch (e) {
+    catch (e: any) {
       if (e instanceof z.ZodError) {
         const tree = z.treeifyError<Message>(e as z.ZodError<Message>)
         if (tree.properties?.type?.errors?.includes('Invalid input')) {
+          // we don't understand this message type... yet
           this.onParseError(`Unrecognized message type`)
           return
         }
       }
-      this.onParseError(`Unknown error when parsing protocol message: ${canonicalize(message)}`)
+      this.onParseError(`Error "${e.message}" when parsing protocol message: ${canonicalize(message)}`)
       return
     }
     this.log.debug(`Parsed protocol message`)
@@ -89,7 +87,7 @@ export class MarabuPeer extends Peer {
   protected override onParseError(description: string) {
     this.error(description, 'INVALID_FORMAT')
   }
-  dispatchMessage(message: Message) {
+  async dispatchMessage(message: Message) {
     const handler = handlers.get(message.type)
     if (!this.handshook && message.type !== 'hello') {
       return this.error(`Received a message of type "${message.type}" prior to handshake`, 'INVALID_HANDSHAKE')
@@ -97,20 +95,16 @@ export class MarabuPeer extends Peer {
     if (handler === undefined) {
       return this.error(`No registered handler to handle message ${message}`)
     }
-    this.log.debug(`Using handler for message of type "${message.type}"`)
-    // handlers may be async (e.g. object validation requires DB lookups)
-    const result = handler.call(this, message)
-    if (result instanceof Promise) {
-      result.catch((e: any) => {
-        this.log.error(`Handler threw unexpected error: ${e.message}`)
-        this.sendError('INTERNAL_ERROR', `Internal error processing message`)
-      })
+    this.log.debug(`Using handler ${handler} for message`)
+    try {
+      await handler.call(this, message)
+    }
+    catch (e: any) {
+      this.log.warn(`Handler failed to handle message ${message}`)
     }
   }
-
-  // PSET1 handlers
-
-  handleHello(message: HelloMessage) {
+  @handle('hello')
+  async handleHello(message: HelloMessage) {
     this.log.info(`Peer handshook with agent "${message.agent}" and version ${message.version}`)
     if (!semver.satisfies(message.version, PROTOCOL_COMPATIBLE_VERSIONS)) {
       return this.error(`Peer is running incompatible version ${message.version}`, 'INVALID_FORMAT')
@@ -118,109 +112,154 @@ export class MarabuPeer extends Peer {
     this.handshook = true
     this.log.info('Handshake completed')
   }
-  handleGetPeers(_: GetPeersMessage) {
+  @handle('getpeers')
+  async handleGetPeers(_: GetPeersMessage) {
     this.log.info(`Peer requested our peers`)
     this.sendPeers()
   }
-  handlePeers(message: PeersMessage) {
+  @handle('peers')
+  async handlePeers(message: PeersMessage) {
     this.log.info(`Peer reported known peers: ${message.peers}`)
     const peersToStore: string[] = message.peers.slice(0, conf.MAX_PEERS_PER_NEIGHBOUR)
     this.peerManager.addKnownPeers(peersToStore)
   }
-  handleError(message: ErrorMessage) {
+  @handle('error')
+  async handleError(message: ErrorMessage) {
+    // log remote error and disconnect
     this.error(`Peer reports error ${message.name}: ${message.description}`)
   }
-
-  // PSET2 handlers
-
+  @handle('ihaveobject')
   async handleIHaveObject(message: IHaveObjectMessage) {
-    const oid = message.objectid
-    this.log.info(`Peer claims to have object ${oid}`)
-
-    const exists = await this.peerManager.objectDB.has(oid)
-    if (!exists) {
-      this.log.info(`Object ${oid} is unknown, requesting it`)
-      this.sendMessage({ type: 'getobject', objectid: oid })
-    }
-    else {
-      this.log.debug(`Object ${oid} already in database, ignoring`)
+    if (!await objectManager.has(message.objectid)) {
+      this.sendGetObject(message.objectid)
     }
   }
+  @handle('getobject')
   async handleGetObject(message: GetObjectMessage) {
-    const oid = message.objectid
-    this.log.info(`Peer requested object ${oid}`)
+    let obj: MarabuObject | undefined
 
-    const obj = await this.peerManager.objectDB.get(oid)
-    if (obj !== null) {
-      this.sendMessage({ type: 'object', object: obj })
+    this.log.debug('Retrieving object from database')
+    obj = await objectManager.get(message.objectid)
+    this.log.debug('Retrieved object from database')
+
+    if (obj === undefined) {
+      this.sendError('UNFINDABLE_OBJECT', `Object with id ${message.objectid} not found`)
+      return
+    }
+    this.sendObject(obj)
+  }
+  @handle('object')
+  async handleObject(message: ObjectMessage) {
+    const objectid = hash(message.object)
+
+    if (objectid === undefined) {
+      this.log.warn(`Received unexpected unhashable object ${message.object}`)
+      return
+    }
+
+    this.peerManager.notifyObjectWaiters(objectid, message.object)
+
+    if (await objectManager.has(objectid)) {
+      this.log.info(`Received already known object ${objectid}`)
+      return
+    }
+
+    if (message.object.type === 'block') {
+      await this.handleBlockObject(message.object as MarabuBlockObject, objectid)
     }
     else {
-      this.sendError('UNKNOWN_OBJECT', `Object ${oid} not found`)
+      await this.handleTransactionObject(message.object as MarabuTxObject, objectid)
     }
   }
-  async handleObject(message: ObjectMessage) {
-    const obj = message.object
-    const oid = objectId(obj)
-    this.log.info(`Received object ${oid}`)
+  private async handleTransactionObject(tx: MarabuTxObject, objectid: string) {
+    const [_, err, desc] = await validateObject(tx)
 
-    // Ignore objects already in db
-    const exists = await this.peerManager.objectDB.has(oid)
-    if (exists) {
-      this.log.debug(`Object ${oid} already in database, ignoring`)
+    if (err !== undefined && desc !== undefined) {
+      this.sendError(err, desc)
       return
     }
+    await objectManager.put(tx)
 
-    // Parse and validate application object
-    let appObj
-    try {
-      appObj = parseApplicationObject(obj)
-    }
-    catch (e) {
-      this.log.warn(`Object ${oid} has invalid format`)
-      this.sendError('INVALID_FORMAT', `Object has invalid format`)
-      return
-    }
-
-    // Validate based on type
-    if (appObj.type === 'transaction') {
-      const result = await validateTransaction(appObj as Transaction, this.peerManager.objectDB)
-      if (!result.valid) {
-        this.log.warn(`Transaction ${oid} validation failed: ${result.error} - ${result.description}`)
-        this.sendError(result.error, result.description)
-        return
+    // broadcast
+    for (let peer of this.peerManager.connections) {
+      if (peer !== this) {
+        peer.sendIHaveObject(objectid)
       }
     }
-    // here we havent implemented the block validation stay tuned :D
-    // so Object is valid and we store it
-    await this.peerManager.objectDB.put(obj)
-    this.log.info(`Stored valid object ${oid}`)
+  }
+  private async handleBlockObject(block: MarabuBlockObject, blockid: string) {
+    this.log.info(`Processing block ${blockid} (${block.txids.length} txs)`)
 
-    // Gossip it
-    this.peerManager.broadcast(
-      { type: 'ihaveobject', objectid: oid },
-      this // exclude the sender
-    )
+    for (const txid of block.txids) {
+      if (await objectManager.has(txid)) continue
+
+      this.log.info(`Block references unknown tx ${txid}, fetching from peers...`)
+      const fetched = await this.requestObjectFromPeers(txid)
+
+      if (fetched === null) {
+        this.sendError('UNFINDABLE_OBJECT', `Cannot find transaction ${txid}`)
+        return
+      }
+
+      let parsed: MarabuObject
+      try {
+        parsed = MarabuObjectSchema.parse(fetched)
+      } catch (e) {
+        this.sendError('UNFINDABLE_OBJECT', `Fetched object ${txid} has invalid format`)
+        return
+      }
+      if (parsed.type !== 'transaction') {
+        this.sendError('UNFINDABLE_OBJECT', `Object ${txid} is not a transaction`)
+        return
+      }
+
+      await objectManager.put(fetched)
+      this.log.info(`Stored fetched transaction ${txid}`)
+    }
+
+    const result = await validateBlock(block, block)
+
+    if (!result.valid) {
+      this.log.warn(`Block ${blockid} invalid: [${result.error}] ${result.description}`)
+      this.sendError(result.error, result.description)
+      return
+    }
+
+    await objectManager.put(block)
+    await saveUTXO(blockid, result.utxoSet)
+    this.log.info(`Stored valid block ${blockid} (UTXO: ${result.utxoSet.size} entries)`)
+
+    for (let peer of this.peerManager.connections) {
+      if (peer !== this) {
+        peer.sendIHaveObject(blockid)
+      }
+    }
   }
-  handleGetMempool(_: GetMempoolMessage) {
-    this.log.info(`Peer requested mempool`)
-    this.sendMessage({ type: 'mempool', txids: [] })
-  }
-  handleMempool(message: MempoolMessage) {
-    this.log.info(`Peer sent mempool with ${message.txids.length} txids`)
-  }
-  handleGetChainTip(_: GetChainTipMessage) {
-    this.log.info(`Peer requested chain tip`)
-    this.sendMessage({
-      type: 'chaintip',
-      blockid: '00000000522473196b73bc619a8b18472c4cb4c6caf785a13fa32aaae7222ff6'
+  private async requestObjectFromPeers(objectid: string, timeoutMs: number = 5000): Promise<any | null> {
+    return new Promise((resolve) => {
+      let resolved = false
+
+      const timer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true
+          this.peerManager.removeObjectWaiter(objectid)
+          resolve(null)
+        }
+      }, timeoutMs)
+
+      this.peerManager.registerObjectWaiter(objectid, (_oid: string, obj: any) => {
+        if (!resolved) {
+          resolved = true
+          clearTimeout(timer)
+          resolve(obj)
+        }
+      })
+
+      for (let peer of this.peerManager.connections) {
+        peer.sendGetObject(objectid)
+      }
     })
   }
-  handleChainTip(message: ChainTipMessage) {
-    this.log.info(`Peer reports chain tip: ${message.blockid}`)
-  }
-
-  // Send helpers
-
   sendHello() {
     const helloMessage: HelloMessage = {
       type: 'hello',
@@ -245,35 +284,53 @@ export class MarabuPeer extends Peer {
     this.log.debug({ peers }, 'Our known peers')
     this.sendMessage(peersMessage)
   }
+  sendIHaveObject(objectid: string) {
+    const iHaveObjectMessage: IHaveObjectMessage = {
+      type: 'ihaveobject',
+      objectid
+    }
+    this.sendMessage(iHaveObjectMessage)
+  }
+  sendGetObject(objectid: string) {
+    const getObjectMessage: GetObjectMessage = {
+      type: 'getobject',
+      objectid
+    }
+    this.sendMessage(getObjectMessage)
+  }
+  sendObject(object: MarabuObject) {
+    const objectMessage: ObjectMessage = {
+      type: 'object',
+      object
+    }
+    this.sendMessage(objectMessage)
+  }
   sendError(name: MarabuError, description: string) {
     const errorMessage: ErrorMessage = {
       type: 'error', name, description
     }
     this.sendMessage(errorMessage)
   }
-  protected override error(description: string, name: MarabuError = 'INTERNAL_ERROR') {
-    try {
-      this.sendError(name, description)
-    }
-    catch {
-      this.log.debug(`Failed to inform peer about "${name}" error: ${description}`)
+  protected override error(description: string, name: MarabuError = 'INTERNAL_ERROR', informPeer: boolean = true) {
+    if (informPeer) {
+      try {
+        this.sendError(name, description)
+      }
+      catch {
+        this.log.debug(`Failed to inform peer about "${name}" error: ${description}`)
+      }
     }
     super.error(description)
     this.peerManager.removeConnection(this)
   }
 }
 
-// Register all handlers 
-handlers.set('hello', MarabuPeer.prototype.handleHello)
-handlers.set('getpeers', MarabuPeer.prototype.handleGetPeers)
-handlers.set('peers', MarabuPeer.prototype.handlePeers)
-handlers.set('error', MarabuPeer.prototype.handleError)
-handlers.set('ihaveobject', MarabuPeer.prototype.handleIHaveObject)
-handlers.set('getobject', MarabuPeer.prototype.handleGetObject)
-handlers.set('object', MarabuPeer.prototype.handleObject)
-handlers.set('getmempool', MarabuPeer.prototype.handleGetMempool)
-handlers.set('mempool', MarabuPeer.prototype.handleMempool)
-handlers.set('getchaintip', MarabuPeer.prototype.handleGetChainTip)
-handlers.set('chaintip', MarabuPeer.prototype.handleChainTip)
+// Decorator used for dispatching
+function handle<K extends Message["type"]>(type: K) {
+  return function (handler: MessageHandler<Extract<Message, { type: K }>>) {
+    log.debug(`Registering handler ${handler.name} for messages of type ${type}`)
+    handlers.set(type, handler as MessageHandler<Message>)
+  }
+}
 
 log.debug(`Registered ${handlers.size} handlers`)
