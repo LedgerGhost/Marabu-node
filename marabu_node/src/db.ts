@@ -20,23 +20,25 @@ class Database {
 
   async has(key: string): Promise<boolean> {
     await this.ensureReady()
-    try {
-      await this.db.get(key)
-      return true
-    } catch (e: any) {
-      if (e.code === 'LEVEL_NOT_FOUND') return false
+    // Level 10: get returns undefined for missing keys (it no longer throws LEVEL_NOT_FOUND).
+    const v = await this.db.get(key).catch((e: any) => {
+      if (e?.code === 'LEVEL_NOT_FOUND') return undefined
       throw e
-    }
+    })
+    return v !== undefined
   }
 
   async get(key: string): Promise<string | undefined> {
     await this.ensureReady()
-    try {
-      return await this.db.get(key)
-    } catch (e: any) {
-      if (e.code === 'LEVEL_NOT_FOUND') return undefined
+    return await this.db.get(key).catch((e: any) => {
+      if (e?.code === 'LEVEL_NOT_FOUND') return undefined
       throw e
-    }
+    })
+  }
+
+  async del(key: string): Promise<void> {
+    await this.ensureReady()
+    await this.db.del(key)
   }
 
   async put(key: string, value: string): Promise<void> {

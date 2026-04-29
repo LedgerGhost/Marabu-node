@@ -10,10 +10,9 @@ import { objectManager } from './objectmanager'
 import canonicalize from 'canonicalize'
 import { log } from './log'
 
-/**
- * Validate a transaction object.
- * Returns [valid, error, description].
- */
+/*
+  Validate a tx object and return [valid, error, description].
+*/
 export async function validate(
   tx: any
 ): Promise<[boolean, MarabuError | undefined, string | undefined]> {

@@ -4,7 +4,8 @@ import conf from '../conf'
 import { log } from '../log'
 import { PeerManager } from './peermanager'
 import { hash, objectManager } from '../objectmanager'
-import { UTXOSet, saveUTXO, hasUTXO } from '../utxo'
+import { UTXOSet, saveUTXO, hasUTXO, saveHeight, hasHeight } from '../utxo'
+import { getChainTip, setChainTip } from '../chain'
 
 const GENESIS_BLOCK = {
   T: '00000000abc00000000000000000000000000000000000000000000000000000',
@@ -29,14 +30,19 @@ export async function run() {
     await objectManager.put(GENESIS_BLOCK)
     log.info('Stored genesis block in object database')
   }
-
   if (!await hasUTXO(GENESIS_BLOCKID)) {
     await saveUTXO(GENESIS_BLOCKID, new UTXOSet())
     log.info('Initialized empty UTXO set for genesis block')
   }
+  if (!await hasHeight(GENESIS_BLOCKID)) {
+    await saveHeight(GENESIS_BLOCKID, 0)
+    log.info('Initialized genesis block height to 0')
+  }
+  if ((await getChainTip()) === null) {
+    await setChainTip(GENESIS_BLOCKID, 0)
+  }
 
   let myPublicIP: string | undefined
-
   try {
     const resp = await fetch(conf.IP_RETRIEVAL_SERVICE)
     myPublicIP = await resp.text()
@@ -46,13 +52,12 @@ export async function run() {
     myPublicIP = '0.0.0.0'
   }
 
-  let peerManager = new PeerManager(myPublicIP)
+  const peerManager = new PeerManager(myPublicIP)
   await peerManager.restore()
 
   const server = createServer(socket => {
-    const peer = new MarabuPeer(socket, peerManager)
+    new MarabuPeer(socket, peerManager)
   })
-
   server.listen(conf.SERVER_PORT, conf.SERVER_HOST)
   log.info(`Listening for connections on ${conf.SERVER_HOST}:${conf.SERVER_PORT}`)
 

@@ -1,19 +1,42 @@
 import { hash, objectManager } from './objectmanager'
 import { validate as validateTx } from './tx'
 import { type MarabuBlockObject, type MarabuTxObject, type MarabuError } from './net/protocol'
-import { type CoinbaseTransaction, type RegularTransaction, isCoinbase as isCoinbaseTx } from './objects'
-import { UTXOSet, loadUTXO } from './utxo'
+import {
+  type CoinbaseTransaction,
+  type RegularTransaction,
+  isCoinbase as isCoinbaseTx,
+  BlockSchema
+} from './objects'
+import {
+  UTXOSet,
+  loadUTXO,
+  saveUTXO,
+  loadHeight,
+  saveHeight,
+  hasHeight
+} from './utxo'
 import { log } from './log'
 
 const REQUIRED_TARGET = '00000000abc00000000000000000000000000000000000000000000000000000'
 const GENESIS_BLOCKID = '00000000522473196b73bc619a8b18472c4cb4c6caf785a13fa32aaae7222ff6'
 const BLOCK_REWARD = 50_000_000_000_000
 
-export type BlockValidationResult =
-  | { valid: true, utxoSet: UTXOSet }
-  | { valid: false, error: MarabuError, description: string }
+export type BlockValidationOk = {
+  valid: true
+  blockid: string
+  height: number
+  utxoSet: UTXOSet
+}
+export type BlockValidationFail = {
+  valid: false
+  error: MarabuError
+  description: string
+}
+export type BlockValidationResult = BlockValidationOk | BlockValidationFail
 
-function fail(error: MarabuError, description: string): BlockValidationResult {
+export type ParentFetcher = (parentid: string) => Promise<any | null>
+
+function fail(error: MarabuError, description: string): BlockValidationFail {
   return { valid: false, error, description }
 }
 
@@ -22,39 +45,123 @@ function isCoinbase(tx: MarabuTxObject): tx is CoinbaseTransaction {
 }
 
 function satisfiesPoW(blockid: string, target: string): boolean {
+  // Both blockid and target are 64-char lowercase hex strings,
+  // so lexicographic comparison matches numeric comparison.
   return blockid < target
 }
 
-export async function validateBlock(
-  block: MarabuBlockObject,
-  blockRaw: any
+/**
+ * Validate a block. If `block.previd` points to an unknown block,
+ * `fetchParent(parentid)` is invoked to obtain the raw parent block JSON
+ * (e.g. via getobject to peers). The parent is then recursively validated.
+ *
+ * On success: stores the block, the height after the block and the UTXO
+ * set after the block, and returns the height + utxo set.
+ * On failure: returns the appropriate Marabu error code and description.
+ */
+export async function validateAndStoreBlock(
+  blockRaw: any,
+  fetchParent: ParentFetcher,
+  visited: Set<string> = new Set()
 ): Promise<BlockValidationResult> {
 
-  const blockid = hash(blockRaw)
-  if (blockid === undefined) {
-    return fail('INVALID_FORMAT', 'Block is not hashable')
+  // 1. Strict format parsing.
+  let block: MarabuBlockObject
+  try {
+    block = BlockSchema.parse(blockRaw)
+  } catch (e: any) {
+    return fail('INVALID_FORMAT', `Block has invalid format: ${e.message}`)
   }
 
-  // Target
+  // 2. Hash the block.
+  const blockid = hash(blockRaw)
+  if (blockid === undefined) {
+    return fail('INVALID_FORMAT', 'Block is not canonicalizable')
+  }
+
+  // Short circuit: we have already validated this block.
+  if (await hasHeight(blockid)) {
+    const height = (await loadHeight(blockid))!
+    const utxoSet = await loadUTXO(blockid)
+    return { valid: true, blockid, height, utxoSet: utxoSet ?? new UTXOSet() }
+  }
+
+  // Cycle protection (PoW makes this practically impossible, but be safe).
+  if (visited.has(blockid)) {
+    return fail('UNFINDABLE_OBJECT', `Cycle detected at block ${blockid}`)
+  }
+  visited.add(blockid)
+
+  // 3. Target.
   if (block.T !== REQUIRED_TARGET) {
     return fail('INVALID_FORMAT', `Block target must be ${REQUIRED_TARGET}, got ${block.T}`)
   }
 
-  // Genesis
+  // 4. Genesis short circuit.
   if (block.previd === null) {
     if (blockid !== GENESIS_BLOCKID) {
-      return fail('INVALID_GENESIS', 'Block has null previd but is not the genesis block')
+      return fail('INVALID_GENESIS', `Block has null previd but is not the genesis (${blockid})`)
     }
-    return { valid: true, utxoSet: new UTXOSet() }
+    await objectManager.put(block)
+    await saveHeight(blockid, 0)
+    await saveUTXO(blockid, new UTXOSet())
+    return { valid: true, blockid, height: 0, utxoSet: new UTXOSet() }
   }
 
+  // 5. Proof-of-work.
   if (!satisfiesPoW(blockid, block.T)) {
     return fail('INVALID_BLOCK_POW', `Block hash ${blockid} does not satisfy target ${block.T}`)
   }
 
-  // All txids must resolve
-  const transactions: { tx: MarabuTxObject, txid: string }[] = []
+  // 6. Timestamp upper bound (cannot be in the future).
+  const now = Math.floor(Date.now() / 1000)
+  if (block.created > now) {
+    return fail('INVALID_BLOCK_TIMESTAMP', `Block timestamp ${block.created} is in the future (now=${now})`)
+  }
 
+  // 7. Recursive parent validation.
+  let parentRaw: any | null = null
+
+  // Try local DB first.
+  const parentObj = await objectManager.get(block.previd)
+  if (parentObj !== undefined && parentObj.type === 'block') {
+    parentRaw = parentObj
+  }
+  if (parentRaw === null) {
+    parentRaw = await fetchParent(block.previd)
+  }
+  if (parentRaw === null) {
+    return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} not available`)
+  }
+
+  // Hash check on the fetched parent.
+  const fetchedId = hash(parentRaw)
+  if (fetchedId !== block.previd) {
+    return fail('UNFINDABLE_OBJECT', `Fetched parent has wrong id ${fetchedId}, expected ${block.previd}`)
+  }
+
+  const parentResult = await validateAndStoreBlock(parentRaw, fetchParent, visited)
+  if (!parentResult.valid) {
+    // Per pset4: if a parent is invalid, send UNFINDABLE_OBJECT for the child.
+    return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} is invalid: [${parentResult.error}] ${parentResult.description}`)
+  }
+
+  // 8. Timestamp must be strictly greater than the parent's.
+  // The parent block must be in the DB now (validateAndStoreBlock stored it).
+  const parentBlock = await objectManager.get(block.previd)
+  if (parentBlock === undefined || parentBlock.type !== 'block') {
+    return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} disappeared after validation`)
+  }
+  if (block.created <= parentBlock.created) {
+    return fail('INVALID_BLOCK_TIMESTAMP',
+      `Block timestamp ${block.created} is not greater than parent ${parentBlock.created}`)
+  }
+
+  const parentHeight = parentResult.height
+  const blockHeight = parentHeight + 1
+
+  // 9. Resolve all txids to transactions in the local DB.
+  const transactions: { tx: MarabuTxObject, txid: string }[] = []
   for (const txid of block.txids) {
     const obj = await objectManager.get(txid)
     if (obj === undefined) {
@@ -66,111 +173,96 @@ export async function validateBlock(
     transactions.push({ tx: obj, txid })
   }
 
-  // Coinbase position
+  // 10. Coinbase: at most one, and only at index 0. Plus height check.
   let coinbaseTx: CoinbaseTransaction | null = null
   let coinbaseTxid: string | null = null
   let coinbaseCount = 0
 
   for (let i = 0; i < transactions.length; i++) {
-    if (isCoinbase(transactions[i]!.tx)) {
+    const t = transactions[i]!
+    if (isCoinbase(t.tx)) {
       coinbaseCount++
       if (i !== 0) {
-        return fail(
-          'INVALID_BLOCK_COINBASE',
-          `Coinbase transaction must be at index 0 in txids, found at index ${i}`
-        )
+        return fail('INVALID_BLOCK_COINBASE',
+          `Coinbase must be at index 0, found at index ${i}`)
       }
-      coinbaseTx = transactions[i]!.tx as CoinbaseTransaction
-      coinbaseTxid = transactions[i]!.txid
+      coinbaseTx = t.tx
+      coinbaseTxid = t.txid
     }
   }
-
   if (coinbaseCount > 1) {
     return fail('INVALID_BLOCK_COINBASE', `Block has ${coinbaseCount} coinbase transactions, max 1`)
   }
 
-  // Coinbase format
   if (coinbaseTx !== null) {
     if (coinbaseTx.outputs.length !== 1) {
       return fail('INVALID_FORMAT', `Coinbase must have exactly 1 output, has ${coinbaseTx.outputs.length}`)
     }
-    if (typeof coinbaseTx.height !== 'number'
-      || !Number.isInteger(coinbaseTx.height)
-      || coinbaseTx.height < 0) {
-      return fail('INVALID_FORMAT', `Coinbase has invalid height`)
+    if (coinbaseTx.height !== blockHeight) {
+      return fail('INVALID_BLOCK_COINBASE',
+        `Coinbase height ${coinbaseTx.height} does not match block height ${blockHeight}`)
     }
   }
 
-  // Parent UTXO
+  // 11. UTXO update.
   const parentUTXO = await loadUTXO(block.previd)
   if (parentUTXO === null) {
-    return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} UTXO set not available`)
+    return fail('UNFINDABLE_OBJECT', `Parent UTXO set for ${block.previd} not available`)
   }
-
   const utxoSet = parentUTXO.clone()
 
-  // Coinbase not spent in same block
+  // Coinbase cannot be spent in the same block.
   if (coinbaseTxid !== null) {
     for (const { tx } of transactions) {
       if (isCoinbase(tx)) continue
-      const regularTx = tx as RegularTransaction
-      if (regularTx.inputs === undefined) continue
-      for (const input of regularTx.inputs) {
+      const reg = tx as RegularTransaction
+      for (const input of reg.inputs) {
         if (input.outpoint.txid === coinbaseTxid) {
-          return fail(
-            'INVALID_TX_OUTPOINT',
-            'Transaction spends coinbase output from the same block'
-          )
+          return fail('INVALID_TX_OUTPOINT',
+            'Transaction spends coinbase output from the same block')
         }
       }
     }
   }
 
-  // Validate each tx and build UTXO set
   let totalFees = 0
-
   for (let i = 0; i < transactions.length; i++) {
     const { tx, txid } = transactions[i]!
 
     if (isCoinbase(tx)) {
-      for (let j = 0; j < tx.outputs.length; j++) {
-        utxoSet.add(txid, j, {
-          pubkey: tx.outputs[j]!.pubkey,
-          value: tx.outputs[j]!.value
-        })
-      }
+      utxoSet.add(txid, 0, { pubkey: tx.outputs[0]!.pubkey, value: tx.outputs[0]!.value })
       continue
     }
 
-    const regularTx = tx as RegularTransaction
-    if (regularTx.inputs === undefined) {
-      return fail('INVALID_FORMAT', `Non-coinbase transaction ${txid} has no inputs`)
-    }
-
+    const reg = tx as RegularTransaction
     let inputSum = 0
-    for (const input of regularTx.inputs) {
-      const utxoEntry = utxoSet.get(input.outpoint.txid, input.outpoint.index)
-      if (utxoEntry === undefined) {
-        return fail(
-          'INVALID_TX_OUTPOINT',
-          `Input ${input.outpoint.txid}:${input.outpoint.index} not in UTXO set`
-        )
+    for (const input of reg.inputs) {
+      const entry = utxoSet.get(input.outpoint.txid, input.outpoint.index)
+      if (entry === undefined) {
+        return fail('INVALID_TX_OUTPOINT',
+          `Input ${input.outpoint.txid}:${input.outpoint.index} not in UTXO set`)
       }
-      inputSum += utxoEntry.value
+      inputSum += entry.value
     }
 
     const [valid, err, desc] = await validateTx(tx)
     if (!valid && err !== undefined && desc !== undefined) {
+      // The tx is in the DB but is invalid as part of this block.
+      // Per pset3, we treat invalid txs in a block as UNFINDABLE_OBJECT.
+      if (err === 'INVALID_TX_SIGNATURE'
+        || err === 'INVALID_TX_CONSERVATION'
+        || err === 'INVALID_TX_OUTPOINT'
+        || err === 'UNKNOWN_OBJECT') {
+        return fail('UNFINDABLE_OBJECT', `Invalid transaction ${txid} in block: ${desc}`)
+      }
       return fail(err, desc)
     }
 
     let outputSum = 0
-    for (const output of tx.outputs) {
-      outputSum += output.value
-    }
-    totalFees += (inputSum - outputSum)
+    for (const out of tx.outputs) outputSum += out.value
+    totalFees += inputSum - outputSum
 
-    for (const input of regularTx.inputs) {
+    for (const input of reg.inputs) {
       utxoSet.remove(input.outpoint.txid, input.outpoint.index)
     }
     for (let j = 0; j < tx.outputs.length; j++) {
@@ -181,21 +273,58 @@ export async function validateBlock(
     }
   }
 
-  // Coinbase conservation
+  // 12. Coinbase law of conservation.
   if (coinbaseTx !== null) {
     const coinbaseOutput = coinbaseTx.outputs[0]!.value
     const maxAllowed = BLOCK_REWARD + totalFees
-
     if (coinbaseOutput > maxAllowed) {
-      return fail(
-        'INVALID_BLOCK_COINBASE',
-        `Coinbase output ${coinbaseOutput} exceeds max ${maxAllowed} (reward ${BLOCK_REWARD} + fees ${totalFees})`
-      )
+      return fail('INVALID_BLOCK_COINBASE',
+        `Coinbase output ${coinbaseOutput} exceeds max ${maxAllowed} (reward ${BLOCK_REWARD} + fees ${totalFees})`)
     }
   }
 
-  log.info(`Block ${blockid} validated (${transactions.length} txs, UTXO: ${utxoSet.size} entries)`)
-  return { valid: true, utxoSet }
+  // 13. Persist block, height, UTXO.
+  await objectManager.put(block)
+  await saveHeight(blockid, blockHeight)
+  await saveUTXO(blockid, utxoSet)
+
+  log.info(`Block ${blockid} validated (height ${blockHeight}, ${transactions.length} txs)`)
+  return { valid: true, blockid, height: blockHeight, utxoSet }
 }
 
-export { REQUIRED_TARGET, GENESIS_BLOCKID, BLOCK_REWARD, satisfiesPoW, isCoinbase }
+/**
+ * Quick pre-flight check before any I/O is performed for a block:
+ * format, hardcoded target and PoW. This avoids letting an attacker
+ * trigger network requests by sending malformed or PoW-invalid blocks.
+ *
+ * Returns null on success, or a validation failure describing the error.
+ */
+export function preValidateBlock(blockRaw: any, blockid: string): BlockValidationFail | null {
+  let block: MarabuBlockObject
+  try {
+    block = BlockSchema.parse(blockRaw)
+  } catch (e: any) {
+    return fail('INVALID_FORMAT', `Block has invalid format: ${e.message}`)
+  }
+  if (block.T !== REQUIRED_TARGET) {
+    return fail('INVALID_FORMAT', `Block target must be ${REQUIRED_TARGET}, got ${block.T}`)
+  }
+  if (block.previd === null) {
+    if (blockid !== GENESIS_BLOCKID) {
+      return fail('INVALID_GENESIS', `Block has null previd but is not the genesis (${blockid})`)
+    }
+    return null
+  }
+  if (!satisfiesPoW(blockid, block.T)) {
+    return fail('INVALID_BLOCK_POW', `Block hash ${blockid} does not satisfy target ${block.T}`)
+  }
+  return null
+}
+
+export {
+  REQUIRED_TARGET,
+  GENESIS_BLOCKID,
+  BLOCK_REWARD,
+  satisfiesPoW,
+  isCoinbase
+}

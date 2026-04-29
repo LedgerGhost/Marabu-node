@@ -65,6 +65,7 @@ export class UTXOSet {
 }
 
 const UTXO_PREFIX = 'utxo:'
+const HEIGHT_PREFIX = 'height:'
 
 export async function saveUTXO(blockid: string, utxoSet: UTXOSet): Promise<void> {
   await db.put(UTXO_PREFIX + blockid, JSON.stringify(utxoSet.serialize()))
@@ -72,21 +73,26 @@ export async function saveUTXO(blockid: string, utxoSet: UTXOSet): Promise<void>
 }
 
 export async function loadUTXO(blockid: string): Promise<UTXOSet | null> {
-  try {
-    const raw = await db.get(UTXO_PREFIX + blockid)
-    return UTXOSet.deserialize(JSON.parse(raw as string) as Record<string, UTXOEntry>)
-  } catch (e: any) {
-    if (e.code === 'LEVEL_NOT_FOUND') return null
-    throw e
-  }
+  const raw = await db.get(UTXO_PREFIX + blockid)
+  if (raw === undefined) return null
+  return UTXOSet.deserialize(JSON.parse(raw) as Record<string, UTXOEntry>)
 }
 
 export async function hasUTXO(blockid: string): Promise<boolean> {
-  try {
-    await db.get(UTXO_PREFIX + blockid)
-    return true
-  } catch (e: any) {
-    if (e.code === 'LEVEL_NOT_FOUND') return false
-    throw e
-  }
+  return await db.has(UTXO_PREFIX + blockid)
+}
+
+export async function saveHeight(blockid: string, height: number): Promise<void> {
+  await db.put(HEIGHT_PREFIX + blockid, String(height))
+}
+
+export async function loadHeight(blockid: string): Promise<number | null> {
+  const raw = await db.get(HEIGHT_PREFIX + blockid)
+  if (raw === undefined) return null
+  const n = parseInt(raw, 10)
+  return Number.isFinite(n) ? n : null
+}
+
+export async function hasHeight(blockid: string): Promise<boolean> {
+  return await db.has(HEIGHT_PREFIX + blockid)
 }
