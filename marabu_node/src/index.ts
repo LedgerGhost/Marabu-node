@@ -14,11 +14,16 @@ if (typeof globalThis.Bun !== 'undefined') {
 }
 
 process.on('uncaughtException', (err) => {
-  log.error(`Uncaught exception: ${err.message}`)
-  log.error(err.stack || '')
+  console.error(`Uncaught exception: ${err.message}`)
+  console.error(err.stack || '')
+  process.exit(1)
 })
 process.on('unhandledRejection', (reason: any) => {
-  log.error(`Unhandled rejection: ${reason?.message || reason}`)
+  console.error(`Unhandled rejection: ${reason?.message || reason}`)
+  if (reason?.stack) {
+    console.error(reason.stack)
+  }
+  process.exit(1)
 })
 
 run()
