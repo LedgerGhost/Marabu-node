@@ -1,7 +1,7 @@
 import { MarabuPeer } from './marabupeer'
 import { log } from '../log'
 import conf from '../conf'
-import { type Addr, isPrivateAddr, parseAddr } from './util'
+import { addrToString, type Addr, isPrivateAddr, parseAddr } from './util'
 import net from 'net'
 import * as fs from 'fs'
 import canonicalize from 'canonicalize'
@@ -171,7 +171,7 @@ export class PeerManager {
 
   getKnownPeerAddrs(): string[] {
     const addrs = Array.from(this.knownPeerAddrs.values())
-    addrs.unshift(`${this.myPublicHost}:${conf.SERVER_PORT}`)
+    addrs.unshift(addrToString([this.myPublicHost, conf.SERVER_PORT]))
     return addrs
   }
   async addKnownPeers(peerAddrs: string[]) {
@@ -198,7 +198,7 @@ export class PeerManager {
         log.warn(`Rejecting unresolvable address "${addr[0]}"`)
         continue
       }
-      const addrStr: string = `${addr[0]}:${addr[1]}`
+      const addrStr = addrToString(addr)
       if (this.knownPeerAddrs.has(addrStr)) {
         log.debug(`Peer is already known`)
         continue
@@ -230,7 +230,7 @@ export class PeerManager {
         || connection.socket.remotePort === undefined) {
         continue
       }
-      connectedAddrs.add(`${connection.socket.remoteAddress}:${connection.socket.remotePort}`)
+      connectedAddrs.add(addrToString([connection.socket.remoteAddress, connection.socket.remotePort]))
     }
     const candidateAddrs: string[] = Array.from(this.knownPeerAddrs.difference(connectedAddrs))
     while (this.connections.size < conf.TARGET_NUM_CONNECTIONS) {
@@ -245,7 +245,13 @@ export class PeerManager {
         throw new Error(`Expected to find missing candidate address at index ${index}`)
       }
       candidateAddrs.splice(index, 1)
-      this.connect(await parseAddr(candidateAddr))
+      try {
+        this.connect(await parseAddr(candidateAddr))
+      } catch (e: any) {
+        log.warn(`Skipping invalid peer candidate "${candidateAddr}": ${e.message}`)
+        this.knownPeerAddrs.delete(candidateAddr)
+        this.save()
+      }
     }
   }
   connect(addr: Addr) {

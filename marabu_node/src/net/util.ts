@@ -5,6 +5,11 @@ import dns from 'dns'
 
 export type Addr = [string, number] // [host, port]
 
+export function addrToString(addr: Addr): string {
+  const [host, port] = addr
+  return isV6(host) ? `[${host}]:${port}` : `${host}:${port}`
+}
+
 // Validate and parse a peer address from "host:port" into [host, port]
 export async function parseAddr(peerAddr: string): Promise<Addr> {
   const addrParts = peerAddr.split(':')
