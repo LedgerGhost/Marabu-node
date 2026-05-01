@@ -19,7 +19,6 @@ import {
   type MarabuTxObject,
   MarabuObjectSchema
 } from './protocol'
-import * as z from 'zod'
 import * as semver from 'semver'
 import { Socket } from 'net'
 import type { PeerManager } from './peermanager'
@@ -34,6 +33,7 @@ const PROTOCOL_COMPATIBLE_VERSIONS = '0.10.x'
 
 type MessageHandler<T> = (this: MarabuPeer, message: T) => Promise<void>
 const handlers = new Map<Message["type"], MessageHandler<Message>>()
+const mempoolTxids = new Set<string>()
 
 export class MarabuPeer extends Peer {
   handshook = false
@@ -72,16 +72,6 @@ export class MarabuPeer extends Peer {
       parsedMessage = MessageSchema.parse(message)
     }
     catch (e: any) {
-      if (e instanceof z.ZodError) {
-        const tree = z.treeifyError<Message>(e as z.ZodError<Message>)
-        if (tree.properties?.type?.errors?.includes('Invalid input')) {
-          // Unknown message type: per protocol, ignore unknown messages
-          // (do NOT close the connection — peers may legitimately speak
-          // newer message types we have not implemented yet).
-          this.log.debug(`Ignoring unrecognized message type`)
-          return
-        }
-      }
       this.onParseError(`Error "${e.message}" when parsing protocol message: ${canonicalize(message)}`)
       return
     }
@@ -97,9 +87,7 @@ export class MarabuPeer extends Peer {
       return this.error(`Received a message of type "${message.type}" prior to handshake`, 'INVALID_HANDSHAKE')
     }
     if (handler === undefined) {
-      // Recognized type but no handler — ignore rather than disconnect.
-      this.log.debug(`No handler for known message type ${message.type}; ignoring`)
-      return
+      return this.error(`No handler for message type ${message.type}`, 'INVALID_FORMAT')
     }
     try {
       await handler.call(this, message)
@@ -140,42 +128,72 @@ export class MarabuPeer extends Peer {
   @handle('getobject')
   async handleGetObject(message: GetObjectMessage) {
     const obj = await objectManager.get(message.objectid)
-    if (obj === undefined) {
-      this.sendError('UNFINDABLE_OBJECT', `Object with id ${message.objectid} not found`)
+    if (obj !== undefined) {
+      this.sendObject(obj)
       return
     }
-    this.sendObject(obj)
+
+    if (!this.peerManager.isObjectProcessing(message.objectid)) {
+      this.sendError('UNKNOWN_OBJECT', `Object with id ${message.objectid} not found`)
+      return
+    }
+
+    // Object not yet in DB, but it is actively being validated. Defer the
+    // response until validation either stores or rejects the object.
+    return new Promise<void>((promiseResolve) => {
+      this.peerManager.registerPendingServe(
+        message.objectid,
+        (resolved: MarabuObject | null) => {
+          if (resolved !== null) {
+            this.sendObject(resolved)
+          } else {
+            this.sendError('UNKNOWN_OBJECT', `Object with id ${message.objectid} not found`)
+          }
+          promiseResolve()
+        },
+        8000
+      )
+    })
   }
   @handle('object')
   async handleObject(message: ObjectMessage) {
+    let object: MarabuObject
+    try {
+      object = MarabuObjectSchema.parse(message.object)
+    } catch (e: any) {
+      return this.error(`Invalid application object: ${e.message}`, 'INVALID_FORMAT')
+    }
+
     const objectid = hash(message.object)
     if (objectid === undefined) {
-      this.log.warn(`Received unhashable object`)
-      return
+      return this.error('Received unhashable object', 'INVALID_FORMAT')
     }
 
     // Notify any pending fetcher waiting for this object id.
-    this.peerManager.notifyObjectWaiters(objectid, message.object)
+    this.peerManager.notifyObjectWaiters(objectid, object)
 
     if (await objectManager.has(objectid)) {
       // Already known and previously accepted as valid.
-      // Per the gossip protocol, advertise it to peers (the sender expects
-      // the rest of the network to learn about it through us).
       this.log.debug(`Already known object ${objectid}; gossiping`)
       this.gossipIHaveObject(objectid)
       return
     }
 
-    if (message.object.type === 'block') {
-      await this.handleBlockObject(message.object as MarabuBlockObject, objectid)
-    } else {
-      await this.handleTransactionObject(message.object as MarabuTxObject, objectid)
+    this.peerManager.markObjectProcessing(objectid)
+    try {
+      if (object.type === 'block') {
+        await this.handleBlockObject(object as MarabuBlockObject, objectid)
+      } else {
+        await this.handleTransactionObject(object as MarabuTxObject, objectid)
+      }
+    } finally {
+      const stored = await objectManager.get(objectid)
+      this.peerManager.finishObjectProcessing(objectid, stored ?? null)
     }
   }
   @handle('getmempool')
   async handleGetMempool(_: GetMempoolMessage) {
-    // Mempool is implemented in pset5. For now, respond with an empty mempool.
-    this.sendMessage({ type: 'mempool', txids: [] } satisfies MempoolMessage)
+    this.sendMessage({ type: 'mempool', txids: Array.from(mempoolTxids) } satisfies MempoolMessage)
   }
   @handle('mempool')
   async handleMempool(_: MempoolMessage) {
@@ -192,7 +210,7 @@ export class MarabuPeer extends Peer {
     if (await objectManager.has(message.blockid)) return
 
     this.log.info(`Peer advertises chain tip ${message.blockid}; fetching`)
-    const obj = await this.requestObjectFromPeers(message.blockid)
+    const obj = await this.requestObjectFromPeer(message.blockid)
     if (obj === null) {
       this.log.warn(`Could not fetch chain tip ${message.blockid} from peers`)
       return
@@ -208,99 +226,70 @@ export class MarabuPeer extends Peer {
   private async handleTransactionObject(tx: MarabuTxObject, objectid: string) {
     const [_, err, desc] = await validateObject(tx)
     if (err !== undefined && desc !== undefined) {
-      this.sendError(err, desc)
-      return
+      return this.error(desc, err)
     }
     await objectManager.put(tx)
+    mempoolTxids.add(objectid)
     this.gossipIHaveObject(objectid)
   }
   private async handleBlockObject(blockRaw: MarabuBlockObject, blockid: string) {
     this.log.info(`Processing block ${blockid}`)
 
     // Per pset3: format + target + PoW must be checked BEFORE going to
-    // the network for missing transactions or parents. Otherwise an
-    // attacker can spam us with invalid blocks that trigger network I/O.
+    // the network for missing transactions or parents. This prevents an
+    // attacker from triggering network I/O with malformed/PoW-invalid blocks.
     const preCheck = preValidateBlock(blockRaw, blockid)
     if (preCheck !== null) {
       this.log.warn(`Block ${blockid} rejected: [${preCheck.error}] ${preCheck.description}`)
-      this.sendError(preCheck.error, preCheck.description)
-      return
+      return this.error(preCheck.description, preCheck.error)
     }
 
-    // Pre-fetch tx objects referenced by this block; the validator
-    // requires them to be present in the local DB.
-    if (Array.isArray((blockRaw as any).txids)) {
-      for (const txid of (blockRaw as any).txids as string[]) {
-        if (typeof txid !== 'string') continue
-        if (await objectManager.has(txid)) continue
-        const fetched = await this.requestObjectFromPeers(txid)
-        if (fetched === null) {
-          this.sendError('UNFINDABLE_OBJECT', `Cannot find transaction ${txid}`)
-          return
-        }
-        const [valid, ferr, fdesc] = await validateObject(fetched)
-        if (!valid) {
-          this.sendError('UNFINDABLE_OBJECT',
-            `Invalid transaction ${txid} in block: ${ferr} ${fdesc}`)
-          return
-        }
-        await objectManager.put(fetched)
-      }
-    }
-
-    const result = await validateAndStoreBlock(blockRaw, async (parentid: string) => {
-      // Look in the local DB first.
-      const local = await objectManager.get(parentid)
-      if (local !== undefined && local.type === 'block') return local
-      return await this.requestObjectFromPeers(parentid)
+    // Full validation. The fetchObject callback is used for both parent blocks
+    // and transactions — no separate pre-fetch loop here, so that timestamp and
+    // other block-level errors take priority over UNFINDABLE_OBJECT for txids.
+    const result = await validateAndStoreBlock(blockRaw, async (objectid: string) => {
+      // Check local DB first (handles the case where we already have it).
+      const local = await objectManager.get(objectid)
+      if (local !== undefined) return local
+      // Otherwise ask peers (deduplicated by PeerManager.fetchObject).
+      return await this.requestObjectFromPeer(objectid)
     })
 
     if (!result.valid) {
       this.log.warn(`Block ${blockid} invalid: [${result.error}] ${result.description}`)
-      this.sendError(result.error, result.description)
-      return
+      return this.error(result.description, result.error)
+    }
+
+    // Block validated and stored. Notify any object waiters, e.g. concurrent
+    // validators that need this block as a parent.
+    const storedBlock = await objectManager.get(result.blockid)
+    if (storedBlock !== undefined) {
+      this.peerManager.notifyObjectWaiters(result.blockid, storedBlock)
     }
 
     await maybeUpdateChainTip(result.blockid)
+    for (const txid of blockRaw.txids) {
+      mempoolTxids.delete(txid)
+    }
     this.gossipIHaveObject(blockid)
   }
   /**
    * Broadcast an ihaveobject for a known good object to all peers.
-   * Includes the originating connection so we satisfy graders that
-   * connect twice and want to see the gossip on the second link.
    */
   private gossipIHaveObject(objectid: string) {
     for (const peer of this.peerManager.connections) {
       if (peer === this) continue
       peer.sendIHaveObject(objectid)
     }
-    // Also advertise back to the sender; harmless and required by some graders.
+    // Also advertise back to the sender.
     this.sendIHaveObject(objectid)
   }
-  private async requestObjectFromPeers(objectid: string, timeoutMs: number = 5000): Promise<any | null> {
-    return new Promise((resolve) => {
-      let resolved = false
-
-      const timer = setTimeout(() => {
-        if (!resolved) {
-          resolved = true
-          this.peerManager.removeObjectWaiter(objectid)
-          resolve(null)
-        }
-      }, timeoutMs)
-
-      this.peerManager.registerObjectWaiter(objectid, (_oid: string, obj: any) => {
-        if (!resolved) {
-          resolved = true
-          clearTimeout(timer)
-          resolve(obj)
-        }
-      })
-
-      for (let peer of this.peerManager.connections) {
-        peer.sendGetObject(objectid)
-      }
-    })
+  /**
+   * Request a single object from peers, deduplicating concurrent requests
+   * via PeerManager.fetchObject.
+   */
+  private async requestObjectFromPeer(objectid: string, timeoutMs: number = 5000): Promise<any | null> {
+    return this.peerManager.fetchObject(objectid, timeoutMs)
   }
   sendHello() {
     const helloMessage: HelloMessage = {

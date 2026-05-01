@@ -6,6 +6,7 @@ import net from 'net'
 import * as fs from 'fs'
 import canonicalize from 'canonicalize'
 import * as z from 'zod'
+import type { MarabuObject } from './protocol'
 
 export class PeerManager {
   // connections contains all peers which I am currently connected to,
@@ -13,11 +14,27 @@ export class PeerManager {
   connections: Set<MarabuPeer> = new Set<MarabuPeer>()
   knownPeerAddrs = new Set<string>()
   myPublicHost: string
+
+  // objectWaiters: callbacks notified when an object arrives via handleObject
   private objectWaiters = new Map<string, ((oid: string, obj: any) => void)[]>()
+
+  // inFlightFetches: deduplicates concurrent requestObjectFromPeers calls for the same id
+  private inFlightFetches = new Map<string, Promise<any | null>>()
+
+  // pendingServes: when a getobject arrives for an object not yet stored,
+  // we register a pending response here and fulfil it once the block is stored.
+  private pendingServes = new Map<string, { resolve: (obj: MarabuObject | null) => void, timer: ReturnType<typeof setTimeout> }[]>()
+
+  // object ids currently being processed. getobject requests for these may
+  // wait for validation; unrelated unknown ids should fail immediately.
+  private processingObjects = new Set<string>()
 
   constructor(myPublicHost: string) {
     this.myPublicHost = myPublicHost
   }
+
+  // ── Object waiter API (used by requestObjectFromPeers) ────────────────────
+
   registerObjectWaiter(objectid: string, handler: (oid: string, obj: any) => void) {
     const existing = this.objectWaiters.get(objectid) || []
     existing.push(handler)
@@ -35,6 +52,123 @@ export class PeerManager {
       this.objectWaiters.delete(objectid)
     }
   }
+
+  markObjectProcessing(objectid: string): void {
+    this.processingObjects.add(objectid)
+  }
+
+  isObjectProcessing(objectid: string): boolean {
+    return this.processingObjects.has(objectid)
+  }
+
+  finishObjectProcessing(objectid: string, obj: MarabuObject | null): void {
+    this.processingObjects.delete(objectid)
+    if (obj === null) {
+      this.rejectPendingServes(objectid)
+    } else {
+      this.fulfillPendingServes(objectid, obj)
+    }
+  }
+
+  // ── Deduplicated network fetch ────────────────────────────────────────────
+
+  /**
+   * Fetch an object from any connected peer, deduplicating concurrent requests.
+   * If another caller is already waiting for `objectid`, the same Promise is
+   * returned so only one round of getobject messages is sent.
+   */
+  fetchObject(objectid: string, timeoutMs: number = 5000): Promise<any | null> {
+    const existing = this.inFlightFetches.get(objectid)
+    if (existing !== undefined) {
+      return existing
+    }
+
+    const promise = new Promise<any | null>((resolve) => {
+      let resolved = false
+
+      const timer = setTimeout(() => {
+        if (!resolved) {
+          resolved = true
+          this.inFlightFetches.delete(objectid)
+          this.removeObjectWaiter(objectid)
+          resolve(null)
+        }
+      }, timeoutMs)
+
+      this.registerObjectWaiter(objectid, (_oid: string, obj: any) => {
+        if (!resolved) {
+          resolved = true
+          clearTimeout(timer)
+          this.inFlightFetches.delete(objectid)
+          resolve(obj)
+        }
+      })
+
+      for (const peer of this.connections) {
+        peer.sendGetObject(objectid)
+      }
+    })
+
+    this.inFlightFetches.set(objectid, promise)
+    return promise
+  }
+
+  // ── Pending-serve API (deferred getobject responses) ──────────────────────
+
+  /**
+   * Register a deferred response for a getobject request.
+   * `callback` is called with the object once it becomes available,
+   * or with null if `timeoutMs` elapses first.
+   */
+  registerPendingServe(
+    objectid: string,
+    callback: (obj: MarabuObject | null) => void,
+    timeoutMs: number = 8000
+  ): void {
+    const timer = setTimeout(() => {
+      callback(null)
+      const list = this.pendingServes.get(objectid)
+      if (list) {
+        this.pendingServes.set(objectid, list.filter(e => e.resolve !== callback))
+        if (this.pendingServes.get(objectid)!.length === 0) {
+          this.pendingServes.delete(objectid)
+        }
+      }
+    }, timeoutMs)
+
+    const list = this.pendingServes.get(objectid) || []
+    list.push({ resolve: callback, timer })
+    this.pendingServes.set(objectid, list)
+  }
+
+  /**
+   * Notify all pending getobject waiters for `objectid` that the object is
+   * now available. Called after a block is successfully validated and stored.
+   */
+  fulfillPendingServes(objectid: string, obj: MarabuObject): void {
+    const list = this.pendingServes.get(objectid)
+    if (list && list.length > 0) {
+      for (const { resolve, timer } of list) {
+        clearTimeout(timer)
+        resolve(obj)
+      }
+      this.pendingServes.delete(objectid)
+    }
+  }
+
+  rejectPendingServes(objectid: string): void {
+    const list = this.pendingServes.get(objectid)
+    if (list && list.length > 0) {
+      for (const { resolve, timer } of list) {
+        clearTimeout(timer)
+        resolve(null)
+      }
+      this.pendingServes.delete(objectid)
+    }
+  }
+
+  // ── Connection management ─────────────────────────────────────────────────
+
   getKnownPeerAddrs(): string[] {
     const addrs = Array.from(this.knownPeerAddrs.values())
     addrs.unshift(`${this.myPublicHost}:${conf.SERVER_PORT}`)
