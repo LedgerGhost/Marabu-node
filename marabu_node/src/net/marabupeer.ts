@@ -27,6 +27,7 @@ import canonicalize from 'canonicalize'
 import { hash, validateObject, objectManager } from '../objectmanager'
 import { validateAndStoreBlock, preValidateBlock } from '../block'
 import { getChainTip, maybeUpdateChainTip } from '../chain'
+import { loadHeight } from '../utxo'
 
 const PROTOCOL_VERSION = '0.10.0'
 const PROTOCOL_COMPATIBLE_VERSIONS = '0.10.x'
@@ -121,6 +122,7 @@ export class MarabuPeer extends Peer {
   }
   @handle('ihaveobject')
   async handleIHaveObject(message: IHaveObjectMessage) {
+    this.peerManager.noteObjectSource(message.objectid, this)
     if (!await objectManager.has(message.objectid)) {
       this.sendGetObject(message.objectid)
     }
@@ -169,17 +171,36 @@ export class MarabuPeer extends Peer {
       return this.error('Received unhashable object', 'INVALID_FORMAT')
     }
 
-    // Notify any pending fetcher waiting for this object id.
+    this.peerManager.noteObjectSource(objectid, this)
+    const wasAlreadyProcessing = this.peerManager.isObjectProcessing(objectid)
+    if (!wasAlreadyProcessing) {
+      this.peerManager.rememberCandidateObject(objectid, object)
+      this.peerManager.markObjectProcessing(objectid)
+    }
+    // Notify any pending fetcher waiting for this object id. The object is only
+    // a validation candidate at this point; it is not served as accepted yet.
     this.peerManager.notifyObjectWaiters(objectid, object)
 
-    if (await objectManager.has(objectid)) {
+    const alreadyStored = await objectManager.has(objectid)
+    const storedBlockHasHeight = object.type === 'block'
+      ? await loadHeight(objectid) !== null
+      : true
+    if (alreadyStored && storedBlockHasHeight) {
       // Already known and previously accepted as valid.
       this.log.debug(`Already known object ${objectid}; gossiping`)
+      this.peerManager.notifyObjectWaiters(objectid, object)
+      if (!wasAlreadyProcessing) {
+        this.peerManager.finishObjectProcessing(objectid, object)
+      }
       this.gossipIHaveObject(objectid)
       return
     }
 
-    this.peerManager.markObjectProcessing(objectid)
+    if (wasAlreadyProcessing) {
+      this.log.debug(`Object ${objectid} is already being processed`)
+      return
+    }
+
     try {
       if (object.type === 'block') {
         await this.handleBlockObject(object as MarabuBlockObject, objectid)
@@ -207,7 +228,21 @@ export class MarabuPeer extends Peer {
   }
   @handle('chaintip')
   async handleChainTip(message: ChainTipMessage) {
-    if (await objectManager.has(message.blockid)) return
+    this.peerManager.noteObjectSource(message.blockid, this)
+
+    const local = await objectManager.get(message.blockid)
+    if (local !== undefined) {
+      if (local.type !== 'block') {
+        this.log.warn(`Chain tip ${message.blockid} is not a block`)
+        return
+      }
+      if (await loadHeight(message.blockid) !== null) {
+        await maybeUpdateChainTip(message.blockid)
+        return
+      }
+      await this.handleBlockObject(local as MarabuBlockObject, message.blockid)
+      return
+    }
 
     this.log.info(`Peer advertises chain tip ${message.blockid}; fetching`)
     const obj = await this.requestObjectFromPeer(message.blockid)
@@ -251,6 +286,8 @@ export class MarabuPeer extends Peer {
       // Check local DB first (handles the case where we already have it).
       const local = await objectManager.get(objectid)
       if (local !== undefined) return local
+      const candidate = this.peerManager.getCandidateObject(objectid)
+      if (candidate !== undefined) return candidate
       // Otherwise ask peers (deduplicated by PeerManager.fetchObject).
       return await this.requestObjectFromPeer(objectid)
     })
@@ -289,7 +326,9 @@ export class MarabuPeer extends Peer {
    * via PeerManager.fetchObject.
    */
   private async requestObjectFromPeer(objectid: string, timeoutMs: number = 5000): Promise<any | null> {
-    return this.peerManager.fetchObject(objectid, timeoutMs)
+    const candidate = this.peerManager.getCandidateObject(objectid)
+    if (candidate !== undefined) return candidate
+    return this.peerManager.fetchObject(objectid, timeoutMs, [this])
   }
   sendHello() {
     const helloMessage: HelloMessage = {

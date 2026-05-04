@@ -40,6 +40,8 @@ export type ObjectFetcher = (objectid: string) => Promise<any | null>
 // Keep ParentFetcher as an alias for backwards compatibility in calling code
 export type ParentFetcher = ObjectFetcher
 
+const inFlightBlockValidations = new Map<string, Promise<BlockValidationResult>>()
+
 function fail(error: MarabuError, description: string): BlockValidationFail {
   return { valid: false, error, description }
 }
@@ -71,7 +73,6 @@ export async function validateAndStoreBlock(
   fetchObject: ObjectFetcher,
   visited: Set<string> = new Set()
 ): Promise<BlockValidationResult> {
-
   // 1. Strict format parsing.
   let block: MarabuBlockObject
   try {
@@ -99,6 +100,27 @@ export async function validateAndStoreBlock(
   }
   visited.add(blockid)
 
+  const inFlight = inFlightBlockValidations.get(blockid)
+  if (inFlight !== undefined) {
+    return await inFlight
+  }
+
+  const validation = validateAndStoreBlockInner(block, blockRaw, blockid, fetchObject, visited)
+  inFlightBlockValidations.set(blockid, validation)
+  try {
+    return await validation
+  } finally {
+    inFlightBlockValidations.delete(blockid)
+  }
+}
+
+async function validateAndStoreBlockInner(
+  block: MarabuBlockObject,
+  blockRaw: any,
+  blockid: string,
+  fetchObject: ObjectFetcher,
+  visited: Set<string>
+): Promise<BlockValidationResult> {
   // 3. Target.
   if (block.T !== REQUIRED_TARGET) {
     return fail('INVALID_FORMAT', `Block target must be ${REQUIRED_TARGET}, got ${block.T}`)

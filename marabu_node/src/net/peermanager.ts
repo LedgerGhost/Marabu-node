@@ -18,6 +18,14 @@ export class PeerManager {
   // objectWaiters: callbacks notified when an object arrives via handleObject
   private objectWaiters = new Map<string, ((oid: string, obj: any) => void)[]>()
 
+  // candidateObjects are objects we received and are currently validating.
+  // They are not served or gossiped as valid, but they can satisfy internal
+  // dependency lookups so out-of-order block chains do not trigger refetches.
+  private candidateObjects = new Map<string, MarabuObject>()
+
+  // Peers that claimed to have or directly sent a given object.
+  private objectSources = new Map<string, Set<MarabuPeer>>()
+
   // inFlightFetches: deduplicates concurrent requestObjectFromPeers calls for the same id
   private inFlightFetches = new Map<string, Promise<any | null>>()
 
@@ -36,6 +44,11 @@ export class PeerManager {
   // ── Object waiter API (used by requestObjectFromPeers) ────────────────────
 
   registerObjectWaiter(objectid: string, handler: (oid: string, obj: any) => void) {
+    const candidate = this.candidateObjects.get(objectid)
+    if (candidate !== undefined) {
+      queueMicrotask(() => handler(objectid, candidate))
+      return
+    }
     const existing = this.objectWaiters.get(objectid) || []
     existing.push(handler)
     this.objectWaiters.set(objectid, existing)
@@ -53,6 +66,27 @@ export class PeerManager {
     }
   }
 
+  rememberCandidateObject(objectid: string, obj: MarabuObject): void {
+    this.candidateObjects.set(objectid, obj)
+  }
+
+  getCandidateObject(objectid: string): MarabuObject | undefined {
+    return this.candidateObjects.get(objectid)
+  }
+
+  forgetCandidateObject(objectid: string): void {
+    this.candidateObjects.delete(objectid)
+  }
+
+  noteObjectSource(objectid: string, peer: MarabuPeer): void {
+    let sources = this.objectSources.get(objectid)
+    if (sources === undefined) {
+      sources = new Set<MarabuPeer>()
+      this.objectSources.set(objectid, sources)
+    }
+    sources.add(peer)
+  }
+
   markObjectProcessing(objectid: string): void {
     this.processingObjects.add(objectid)
   }
@@ -63,6 +97,7 @@ export class PeerManager {
 
   finishObjectProcessing(objectid: string, obj: MarabuObject | null): void {
     this.processingObjects.delete(objectid)
+    this.forgetCandidateObject(objectid)
     if (obj === null) {
       this.rejectPendingServes(objectid)
     } else {
@@ -77,7 +112,16 @@ export class PeerManager {
    * If another caller is already waiting for `objectid`, the same Promise is
    * returned so only one round of getobject messages is sent.
    */
-  fetchObject(objectid: string, timeoutMs: number = 5000): Promise<any | null> {
+  fetchObject(
+    objectid: string,
+    timeoutMs: number = 5000,
+    preferredPeers: MarabuPeer[] = []
+  ): Promise<any | null> {
+    const candidate = this.candidateObjects.get(objectid)
+    if (candidate !== undefined) {
+      return Promise.resolve(candidate)
+    }
+
     const existing = this.inFlightFetches.get(objectid)
     if (existing !== undefined) {
       return existing
@@ -85,10 +129,13 @@ export class PeerManager {
 
     const promise = new Promise<any | null>((resolve) => {
       let resolved = false
+      const requestedPeers = new Set<MarabuPeer>()
+      let fallbackTimer: ReturnType<typeof setTimeout> | undefined
 
       const timer = setTimeout(() => {
         if (!resolved) {
           resolved = true
+          if (fallbackTimer !== undefined) clearTimeout(fallbackTimer)
           this.inFlightFetches.delete(objectid)
           this.removeObjectWaiter(objectid)
           resolve(null)
@@ -99,13 +146,34 @@ export class PeerManager {
         if (!resolved) {
           resolved = true
           clearTimeout(timer)
+          if (fallbackTimer !== undefined) clearTimeout(fallbackTimer)
           this.inFlightFetches.delete(objectid)
           resolve(obj)
         }
       })
 
-      for (const peer of this.connections) {
-        peer.sendGetObject(objectid)
+      const sendRequests = (peers: Iterable<MarabuPeer>) => {
+        for (const peer of peers) {
+          if (requestedPeers.has(peer)) continue
+          if (peer.socket.destroyed || peer.socket.readyState !== 'open') continue
+          requestedPeers.add(peer)
+          peer.sendGetObject(objectid)
+        }
+      }
+
+      sendRequests(preferredPeers)
+      const sources = this.objectSources.get(objectid)
+      if (sources !== undefined) {
+        sendRequests(sources)
+      }
+
+      if (requestedPeers.size === 0) {
+        sendRequests(this.connections)
+      } else {
+        const fallbackMs = Math.min(2000, Math.max(250, Math.floor(timeoutMs / 2)))
+        fallbackTimer = setTimeout(() => {
+          if (!resolved) sendRequests(this.connections)
+        }, fallbackMs)
       }
     })
 
@@ -220,6 +288,12 @@ export class PeerManager {
   }
   async removeConnection(peer: MarabuPeer) {
     this.connections.delete(peer)
+    for (const [objectid, sources] of this.objectSources) {
+      sources.delete(peer)
+      if (sources.size === 0) {
+        this.objectSources.delete(objectid)
+      }
+    }
     await this.connectSufficiently()
   }
   async connectSufficiently() {
