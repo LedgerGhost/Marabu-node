@@ -39,8 +39,9 @@ const mempoolTxids = new Set<string>()
 export class MarabuPeer extends Peer {
   handshook = false
   peerManager: PeerManager
+  private chainTipPoll: ReturnType<typeof setInterval> | undefined
 
-  constructor(socket: Socket, peerManager: PeerManager) {
+  constructor(socket: Socket, peerManager: PeerManager, private readonly outbound = false) {
     super(socket)
     this.peerManager = peerManager
     this.peerManager.addConnection(this)
@@ -65,6 +66,22 @@ export class MarabuPeer extends Peer {
     this.sendGetPeers()
     // pset4: ask peers for their chain tip on bootstrap
     this.sendGetChainTip()
+    if (this.outbound) {
+      this.startChainTipPolling()
+    }
+  }
+  private startChainTipPolling() {
+    if (this.chainTipPoll !== undefined) return
+    const intervalMs = 15_000 + Math.floor(Math.random() * 5_000)
+    this.chainTipPoll = setInterval(() => {
+      if (this.socket.destroyed || this.socket.readyState !== 'open') return
+      this.sendGetChainTip()
+    }, intervalMs)
+  }
+  private stopChainTipPolling() {
+    if (this.chainTipPoll === undefined) return
+    clearInterval(this.chainTipPoll)
+    this.chainTipPoll = undefined
   }
   protected override onNetworkMessage(message: any) {
     let parsedMessage: Message | undefined
@@ -379,6 +396,7 @@ export class MarabuPeer extends Peer {
     this.sendMessage({ type: 'error', name, description } satisfies ErrorMessage)
   }
   protected override error(description: string, name: MarabuError = 'INTERNAL_ERROR', informPeer: boolean = true) {
+    this.stopChainTipPolling()
     if (informPeer) {
       try {
         this.sendError(name, description)

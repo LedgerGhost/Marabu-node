@@ -335,7 +335,7 @@ export class PeerManager {
     const client = new net.Socket()
     client.connect(port, host)
 
-    return new MarabuPeer(client, this)
+    return new MarabuPeer(client, this, true)
   }
   save() {
     log.debug(`Persisting ${this.knownPeerAddrs.size} peers to file`)

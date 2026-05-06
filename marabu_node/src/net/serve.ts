@@ -56,7 +56,7 @@ export async function run() {
   await peerManager.restore()
 
   const server = createServer(socket => {
-    new MarabuPeer(socket, peerManager)
+    new MarabuPeer(socket, peerManager, false)
   })
   server.listen(conf.SERVER_PORT, conf.SERVER_HOST)
   log.info(`Listening for connections on ${conf.SERVER_HOST}:${conf.SERVER_PORT}`)

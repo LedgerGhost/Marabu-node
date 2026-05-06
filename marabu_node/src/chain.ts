@@ -12,42 +12,19 @@ export interface ChainTip {
 }
 
 export async function getChainTip(): Promise<ChainTip | null> {
-  const raw = await db.get(CHAINTIP_KEY)
-  let current: ChainTip | null = null
-  if (raw !== undefined) {
-    try {
-      current = JSON.parse(raw) as ChainTip
-    } catch {
-      current = null
-    }
-  }
-  const currentHeight = current !== null
-    ? await getLocallyValidatedChainHeight(current.blockid)
-    : null
+  const current = await loadStoredChainTip()
+  const currentValid = current !== null
+    ? await isLocallyValidatedChainAtHeight(current.blockid, current.height)
+    : false
 
-  const best = await getBestKnownChainTip()
-  if (best === null) {
-    if (current !== null && currentHeight !== null) {
-      if (current.height !== currentHeight) {
-        await setChainTip(current.blockid, currentHeight)
-      }
-      return { blockid: current.blockid, height: currentHeight }
-    }
-    return null
-  }
-
-  if (current === null
-    || currentHeight === null
-    || best.height > currentHeight
-  ) {
+  const best = await getBestKnownChainTip(currentValid ? current!.height : -1)
+  if (best !== null) {
     await setChainTip(best.blockid, best.height)
     return best
   }
 
-  if (current.height !== currentHeight) {
-    await setChainTip(current.blockid, currentHeight)
-  }
-  return { blockid: current.blockid, height: currentHeight }
+  if (currentValid) return current
+  return null
 }
 
 export async function setChainTip(blockid: string, height: number): Promise<void> {
@@ -58,9 +35,12 @@ export async function setChainTip(blockid: string, height: number): Promise<void
 // Update tip if `blockid` is at greater height than current tip.
 // Returns true iff the tip was changed.
 export async function maybeUpdateChainTip(blockid: string): Promise<boolean> {
-  const height = await getLocallyValidatedChainHeight(blockid)
+  const height = await loadHeight(blockid)
   if (height === null) return false
-  const current = await getChainTip()
+  const current = await loadStoredChainTip()
+  if (current !== null && current.height >= height) return false
+  if (!await isLocallyValidatedChainAtHeight(blockid, height)) return false
+
   if (current === null || height > current.height) {
     await setChainTip(blockid, height)
     return true
@@ -68,48 +48,52 @@ export async function maybeUpdateChainTip(blockid: string): Promise<boolean> {
   return false
 }
 
-async function getBestKnownChainTip(): Promise<ChainTip | null> {
-  const heights = await loadAllHeights()
-  let best: ChainTip | null = null
-
-  for (const candidate of heights) {
-    const height = await getLocallyValidatedChainHeight(candidate.blockid)
-    if (height === null) continue
-    if (candidate.height !== height) {
-      log.warn(`Ignoring height metadata mismatch for ${candidate.blockid}: saved=${candidate.height}, actual=${height}`)
-      continue
-    }
-    if (best === null || height > best.height) {
-      best = { blockid: candidate.blockid, height }
-    }
+async function loadStoredChainTip(): Promise<ChainTip | null> {
+  const raw = await db.get(CHAINTIP_KEY)
+  if (raw === undefined) return null
+  try {
+    const parsed = JSON.parse(raw) as ChainTip
+    if (typeof parsed.blockid !== 'string' || typeof parsed.height !== 'number') return null
+    return parsed
+  } catch {
+    return null
   }
-  return best
 }
 
-async function getLocallyValidatedChainHeight(blockid: string): Promise<number | null> {
+async function getBestKnownChainTip(minHeightExclusive: number): Promise<ChainTip | null> {
+  const heights = await loadAllHeights()
+  heights.sort((a, b) => b.height - a.height)
+
+  for (const candidate of heights) {
+    if (candidate.height <= minHeightExclusive) return null
+    if (!await isLocallyValidatedChainAtHeight(candidate.blockid, candidate.height)) {
+      log.warn(`Ignoring invalid chain tip candidate ${candidate.blockid} at height ${candidate.height}`)
+      continue
+    }
+    return candidate
+  }
+  return null
+}
+
+async function isLocallyValidatedChainAtHeight(blockid: string, height: number): Promise<boolean> {
   const seen = new Set<string>()
   let cursor: string | null = blockid
-  const chain: string[] = []
+  let expectedHeight = height
 
   while (cursor !== null) {
-    if (seen.has(cursor)) return null
+    if (seen.has(cursor) || expectedHeight < 0) return false
     seen.add(cursor)
-    chain.push(cursor)
 
+    const storedHeight = await loadHeight(cursor)
+    if (storedHeight !== expectedHeight) return false
     const block = await objectManager.get(cursor)
-    if (block === undefined || block.type !== 'block') return null
+    if (block === undefined || block.type !== 'block') return false
     if (block.previd === null) {
-      if (cursor !== GENESIS_BLOCKID) return null
-      const tipHeight = chain.length - 1
-      for (let i = 0; i < chain.length; i++) {
-        const storedHeight = await loadHeight(chain[i]!)
-        const expectedHeight = tipHeight - i
-        if (storedHeight !== expectedHeight) return null
-      }
-      return tipHeight
+      return cursor === GENESIS_BLOCKID && expectedHeight === 0
     }
     cursor = block.previd
+    expectedHeight--
   }
 
-  return null
+  return false
 }
