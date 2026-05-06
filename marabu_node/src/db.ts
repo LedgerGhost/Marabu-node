@@ -46,6 +46,15 @@ class Database {
     await this.db.put(key, value)
   }
 
+  async keys(gte: string, lt: string): Promise<string[]> {
+    await this.ensureReady()
+    const keys: string[] = []
+    for await (const key of this.db.keys({ gte, lt })) {
+      keys.push(key)
+    }
+    return keys
+  }
+
   async close(): Promise<void> {
     await this.ensureReady()
     await this.db.close()

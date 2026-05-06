@@ -163,6 +163,11 @@ export class MarabuPeer extends Peer {
     try {
       object = MarabuObjectSchema.parse(message.object)
     } catch (e: any) {
+      const objectid = hash(message.object)
+      if (objectid !== undefined) {
+        this.peerManager.noteObjectSource(objectid, this)
+        this.peerManager.notifyObjectWaiters(objectid, message.object)
+      }
       return this.error(`Invalid application object: ${e.message}`, 'INVALID_FORMAT')
     }
 
@@ -197,8 +202,7 @@ export class MarabuPeer extends Peer {
     }
 
     if (wasAlreadyProcessing) {
-      this.log.debug(`Object ${objectid} is already being processed`)
-      return
+      this.log.debug(`Object ${objectid} is already being processed; awaiting result for this peer`)
     }
 
     try {
@@ -208,8 +212,10 @@ export class MarabuPeer extends Peer {
         await this.handleTransactionObject(object as MarabuTxObject, objectid)
       }
     } finally {
-      const stored = await objectManager.get(objectid)
-      this.peerManager.finishObjectProcessing(objectid, stored ?? null)
+      if (!wasAlreadyProcessing) {
+        const stored = await objectManager.get(objectid)
+        this.peerManager.finishObjectProcessing(objectid, stored ?? null)
+      }
     }
   }
   @handle('getmempool')

@@ -93,6 +93,19 @@ export async function loadHeight(blockid: string): Promise<number | null> {
   return Number.isFinite(n) ? n : null
 }
 
+export async function loadAllHeights(): Promise<{ blockid: string, height: number }[]> {
+  const keys = await db.keys(HEIGHT_PREFIX, `${HEIGHT_PREFIX}\xff`)
+  const heights: { blockid: string, height: number }[] = []
+  for (const key of keys) {
+    const blockid = key.slice(HEIGHT_PREFIX.length)
+    const height = await loadHeight(blockid)
+    if (height !== null) {
+      heights.push({ blockid, height })
+    }
+  }
+  return heights
+}
+
 export async function hasHeight(blockid: string): Promise<boolean> {
   return await db.has(HEIGHT_PREFIX + blockid)
 }
