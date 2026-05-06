@@ -166,7 +166,11 @@ export class MarabuPeer extends Peer {
       const objectid = hash(message.object)
       if (objectid !== undefined) {
         this.peerManager.noteObjectSource(objectid, this)
-        this.peerManager.notifyObjectWaiters(objectid, message.object)
+        const wasDependencyResponse = this.peerManager.notifyObjectWaiters(objectid, message.object)
+        if (wasDependencyResponse) {
+          this.log.warn(`Received malformed dependency object ${objectid}; leaving contextual validation to the requester`)
+          return
+        }
       }
       return this.error(`Invalid application object: ${e.message}`, 'INVALID_FORMAT')
     }

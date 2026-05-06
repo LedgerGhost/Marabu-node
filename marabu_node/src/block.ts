@@ -62,8 +62,8 @@ function satisfiesPoW(blockid: string, target: string): boolean {
  *
  * Validation order ensures specific error codes are sent before attempting
  * expensive network I/O for transactions:
- *   Format → Hash → Cache → Target → Genesis → PoW → Future-timestamp →
- *   Parent fetch+recursion → Parent-timestamp → Tx fetch+validate → Coinbase → UTXO
+ *   Format -> Hash -> Cache -> Target -> Genesis -> PoW -> Future-timestamp ->
+ *   Parent fetch+recursion -> Parent-timestamp -> Tx fetch+validate -> Coinbase -> UTXO
  *
  * On success: stores the block, height and UTXO set, returns height + utxo.
  * On failure: returns the appropriate Marabu error code and description.
@@ -340,8 +340,8 @@ async function validateAndStoreBlockInner(
 
 /**
  * Quick pre-flight check before any I/O is performed for a block:
- * format, hardcoded target and PoW. This avoids letting an attacker
- * trigger network requests by sending malformed or PoW-invalid blocks.
+ * format, hardcoded target, PoW and future timestamp. This avoids letting an
+ * attacker trigger network requests with malformed or impossible blocks.
  *
  * Returns null on success, or a validation failure describing the error.
  */
@@ -363,6 +363,10 @@ export function preValidateBlock(blockRaw: any, blockid: string): BlockValidatio
   }
   if (!satisfiesPoW(blockid, block.T)) {
     return fail('INVALID_BLOCK_POW', `Block hash ${blockid} does not satisfy target ${block.T}`)
+  }
+  const now = Math.floor(Date.now() / 1000)
+  if (block.created > now) {
+    return fail('INVALID_BLOCK_TIMESTAMP', `Block timestamp ${block.created} is in the future (now=${now})`)
   }
   return null
 }

@@ -56,14 +56,16 @@ export class PeerManager {
   removeObjectWaiter(objectid: string) {
     this.objectWaiters.delete(objectid)
   }
-  notifyObjectWaiters(objectid: string, obj: any) {
+  notifyObjectWaiters(objectid: string, obj: any): boolean {
     const waiters = this.objectWaiters.get(objectid)
     if (waiters && waiters.length > 0) {
       for (const handler of waiters) {
         try { handler(objectid, obj) } catch { }
       }
       this.objectWaiters.delete(objectid)
+      return true
     }
+    return false
   }
 
   rememberCandidateObject(objectid: string, obj: MarabuObject): void {
