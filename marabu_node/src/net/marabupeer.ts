@@ -288,7 +288,8 @@ export class MarabuPeer extends Peer {
   private async handleTransactionObject(tx: MarabuTxObject, objectid: string) {
     const [_, err, desc] = await validateObject(tx)
     if (err !== undefined && desc !== undefined) {
-      return this.error(desc, err)
+      this.sendError(err, desc)
+      return
     }
     await objectManager.put(tx)
     mempoolTxids.add(objectid)
@@ -303,7 +304,8 @@ export class MarabuPeer extends Peer {
     const preCheck = preValidateBlock(blockRaw, blockid)
     if (preCheck !== null) {
       this.log.warn(`Block ${blockid} rejected: [${preCheck.error}] ${preCheck.description}`)
-      return this.error(preCheck.description, preCheck.error)
+      this.sendError(preCheck.error, preCheck.description)
+      return
     }
 
     // Full validation. The fetchObject callback is used for both parent blocks
@@ -321,7 +323,8 @@ export class MarabuPeer extends Peer {
 
     if (!result.valid) {
       this.log.warn(`Block ${blockid} invalid: [${result.error}] ${result.description}`)
-      return this.error(result.description, result.error)
+      this.sendError(result.error, result.description)
+      return
     }
 
     // Block validated and stored. Notify any object waiters, e.g. concurrent
