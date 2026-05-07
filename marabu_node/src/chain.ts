@@ -1,5 +1,5 @@
 import db from './db'
-import { loadAllHeights, loadHeight } from './utxo'
+import { loadAllHeights, loadHeight, loadUTXO } from './utxo'
 import { log } from './log'
 import { objectManager } from './objectmanager'
 import { GENESIS_BLOCKID } from './block'
@@ -48,6 +48,46 @@ export async function maybeUpdateChainTip(blockid: string): Promise<boolean> {
   return false
 }
 
+export async function getDisconnectedTxids(oldTip: string | null, newTip: string): Promise<string[]> {
+  if (oldTip === null || oldTip === newTip) return []
+
+  let oldCursor: string | null = oldTip
+  let newCursor: string | null = newTip
+  let oldHeight = await loadHeight(oldCursor)
+  let newHeight = await loadHeight(newCursor)
+  if (oldHeight === null || newHeight === null) return []
+
+  const disconnectedTipFirst: string[] = []
+
+  while (oldCursor !== null && oldHeight > newHeight) {
+    const info = await loadStoredBlockInfo(oldCursor)
+    if (info === null) return disconnectedTipFirst.reverse()
+    disconnectedTipFirst.push(...info.txids)
+    oldCursor = info.previd
+    oldHeight--
+  }
+
+  while (newCursor !== null && newHeight > oldHeight) {
+    const info = await loadStoredBlockInfo(newCursor)
+    if (info === null) return disconnectedTipFirst.reverse()
+    newCursor = info.previd
+    newHeight--
+  }
+
+  while (oldCursor !== null && newCursor !== null && oldCursor !== newCursor) {
+    const oldInfo = await loadStoredBlockInfo(oldCursor)
+    const newInfo = await loadStoredBlockInfo(newCursor)
+    if (oldInfo === null || newInfo === null) return disconnectedTipFirst.reverse()
+    disconnectedTipFirst.push(...oldInfo.txids)
+    oldCursor = oldInfo.previd
+    newCursor = newInfo.previd
+    oldHeight--
+    newHeight--
+  }
+
+  return disconnectedTipFirst.reverse()
+}
+
 async function loadStoredChainTip(): Promise<ChainTip | null> {
   const raw = await db.get(CHAINTIP_KEY)
   if (raw === undefined) return null
@@ -86,8 +126,9 @@ async function isLocallyValidatedChainAtHeight(blockid: string, height: number):
 
     const storedHeight = await loadHeight(cursor)
     if (storedHeight !== expectedHeight) return false
-    const block = await objectManager.get(cursor)
-    if (block === undefined || block.type !== 'block') return false
+    if (await loadUTXO(cursor) === null) return false
+    const block = await loadStoredBlockInfo(cursor)
+    if (block === null) return false
     if (block.previd === null) {
       return cursor === GENESIS_BLOCKID && expectedHeight === 0
     }
@@ -96,4 +137,13 @@ async function isLocallyValidatedChainAtHeight(blockid: string, height: number):
   }
 
   return false
+}
+
+async function loadStoredBlockInfo(blockid: string): Promise<{ previd: string | null, txids: string[] } | null> {
+  const raw = await objectManager.getRaw(blockid)
+  if (raw === undefined || raw === null || raw.type !== 'block') return null
+  if (raw.previd !== null && typeof raw.previd !== 'string') return null
+  if (!Array.isArray(raw.txids)) return null
+  const txids = raw.txids.filter((txid: unknown): txid is string => typeof txid === 'string')
+  return { previd: raw.previd, txids }
 }

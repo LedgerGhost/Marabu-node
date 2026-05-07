@@ -36,19 +36,16 @@ class ObjectManager {
     return await db.has(`object:${objectid}`)
   }
   async get(objectid: string): Promise<MarabuObject | undefined> {
-    const objStr = await db.get(`object:${objectid}`)
-    if (objStr === undefined) {
-      return undefined
-    }
     let obj
-    let parsed
     try {
-      obj = JSON.parse(objStr)
+      obj = await this.getRaw(objectid)
     }
     catch (e) {
-      log.warn(`Retrieved object from database, but it is not valid JSON: ${obj}`)
       return undefined
     }
+    if (obj === undefined) return undefined
+
+    let parsed
     try {
       parsed = MarabuObjectSchema.parse(obj)
     }
@@ -57,6 +54,19 @@ class ObjectManager {
       return undefined
     }
     return parsed
+  }
+  async getRaw(objectid: string): Promise<any | undefined> {
+    const objStr = await db.get(`object:${objectid}`)
+    if (objStr === undefined) {
+      return undefined
+    }
+    try {
+      return JSON.parse(objStr)
+    }
+    catch (e) {
+      log.warn(`Retrieved object from database, but it is not valid JSON: ${objStr}`)
+      return undefined
+    }
   }
   async put(object: any) {
     const str = canonicalize(object)

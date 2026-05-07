@@ -26,15 +26,19 @@ import { log } from '../log'
 import canonicalize from 'canonicalize'
 import { hash, validateObject, objectManager } from '../objectmanager'
 import { validateAndStoreBlock, preValidateBlock } from '../block'
-import { getChainTip, maybeUpdateChainTip } from '../chain'
+import { getChainTip, getDisconnectedTxids, maybeUpdateChainTip } from '../chain'
 import { loadHeight } from '../utxo'
+import {
+  addTransactionToMempool,
+  getMempoolTxids,
+  rebuildMempool
+} from '../mempool'
 
 const PROTOCOL_VERSION = '0.10.0'
 const PROTOCOL_COMPATIBLE_VERSIONS = '0.10.x'
 
 type MessageHandler<T> = (this: MarabuPeer, message: T) => Promise<void>
 const handlers = new Map<Message["type"], MessageHandler<Message>>()
-const mempoolTxids = new Set<string>()
 
 export class MarabuPeer extends Peer {
   handshook = false
@@ -135,7 +139,12 @@ export class MarabuPeer extends Peer {
   }
   @handle('error')
   async handleError(message: ErrorMessage) {
-    this.error(`Peer reports error ${message.name}: ${message.description}`)
+    const description = `Peer reports error ${message.name}: ${message.description}`
+    if (message.name === 'INVALID_FORMAT' || message.name === 'INVALID_HANDSHAKE') {
+      this.error(description, message.name, false)
+      return
+    }
+    this.log.warn(description)
   }
   @handle('ihaveobject')
   async handleIHaveObject(message: IHaveObjectMessage) {
@@ -241,7 +250,8 @@ export class MarabuPeer extends Peer {
   }
   @handle('getmempool')
   async handleGetMempool(_: GetMempoolMessage) {
-    this.sendMessage({ type: 'mempool', txids: Array.from(mempoolTxids) } satisfies MempoolMessage)
+    await rebuildMempool()
+    this.sendMessage({ type: 'mempool', txids: getMempoolTxids() } satisfies MempoolMessage)
   }
   @handle('mempool')
   async handleMempool(_: MempoolMessage) {
@@ -292,7 +302,10 @@ export class MarabuPeer extends Peer {
       return
     }
     await objectManager.put(tx)
-    mempoolTxids.add(objectid)
+    const mempoolResult = await addTransactionToMempool(objectid, tx)
+    if (!mempoolResult.valid) {
+      this.sendError(mempoolResult.error, mempoolResult.description)
+    }
     this.gossipIHaveObject(objectid)
   }
   private async handleBlockObject(blockRaw: MarabuBlockObject, blockid: string) {
@@ -307,6 +320,8 @@ export class MarabuPeer extends Peer {
       this.sendError(preCheck.error, preCheck.description)
       return
     }
+
+    const oldTip = await getChainTip()
 
     // Full validation. The fetchObject callback is used for both parent blocks
     // and transactions — no separate pre-fetch loop here, so that timestamp and
@@ -334,9 +349,10 @@ export class MarabuPeer extends Peer {
       this.peerManager.notifyObjectWaiters(result.blockid, storedBlock)
     }
 
-    await maybeUpdateChainTip(result.blockid)
-    for (const txid of blockRaw.txids) {
-      mempoolTxids.delete(txid)
+    const tipChanged = await maybeUpdateChainTip(result.blockid)
+    if (tipChanged) {
+      const disconnectedTxids = await getDisconnectedTxids(oldTip?.blockid ?? null, result.blockid)
+      await rebuildMempool(disconnectedTxids)
     }
     this.gossipIHaveObject(blockid)
   }
@@ -399,7 +415,6 @@ export class MarabuPeer extends Peer {
     this.sendMessage({ type: 'error', name, description } satisfies ErrorMessage)
   }
   protected override error(description: string, name: MarabuError = 'INTERNAL_ERROR', informPeer: boolean = true) {
-    this.stopChainTipPolling()
     if (informPeer) {
       try {
         this.sendError(name, description)
@@ -408,8 +423,13 @@ export class MarabuPeer extends Peer {
         this.log.debug(`Failed to inform peer about "${name}" error: ${description}`)
       }
     }
-    super.error(description)
-    this.peerManager.removeConnection(this)
+    if (!informPeer || name === 'INVALID_FORMAT' || name === 'INVALID_HANDSHAKE') {
+      this.stopChainTipPolling()
+      super.error(description)
+      this.peerManager.removeConnection(this)
+      return
+    }
+    this.log.error(description)
   }
 }
 

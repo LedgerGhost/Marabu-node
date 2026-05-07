@@ -32,6 +32,15 @@ export async function validate(
 
   const regular = parsed as RegularTransaction
 
+  const seenOutpoints = new Set<string>()
+  for (const input of regular.inputs) {
+    const key = `${input.outpoint.txid}:${input.outpoint.index}`
+    if (seenOutpoints.has(key)) {
+      return [false, 'INVALID_TX_OUTPOINT', `Outpoint ${key} is used more than once`]
+    }
+    seenOutpoints.add(key)
+  }
+
   let inputSum = 0
 
   for (const input of regular.inputs) {

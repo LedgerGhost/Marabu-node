@@ -13,7 +13,6 @@ import {
   saveUTXO,
   loadHeight,
   saveHeight,
-  hasHeight
 } from './utxo'
 import { log } from './log'
 
@@ -62,7 +61,7 @@ function satisfiesPoW(blockid: string, target: string): boolean {
  *
  * Validation order ensures specific error codes are sent before attempting
  * expensive network I/O for transactions:
- *   Format -> Hash -> Cache -> Target -> Genesis -> PoW -> Future-timestamp ->
+ *   Hash -> Cache -> Format -> Target -> Genesis -> PoW -> Future-timestamp ->
  *   Parent fetch+recursion -> Parent-timestamp -> Tx fetch+validate -> Coinbase -> UTXO
  *
  * On success: stores the block, height and UTXO set, returns height + utxo.
@@ -73,25 +72,25 @@ export async function validateAndStoreBlock(
   fetchObject: ObjectFetcher,
   visited: Set<string> = new Set()
 ): Promise<BlockValidationResult> {
+  const blockid = hash(blockRaw)
+  if (blockid === undefined) {
+    return fail('INVALID_FORMAT', 'Block is not canonicalizable')
+  }
+
+  // Short circuit: we have already validated this block. This check happens
+  // before strict parsing so older locally validated ancestry can be used as
+  // an anchor even if a later schema is stricter than the one it was mined with.
+  const known = await loadValidatedBlockState(blockid)
+  if (known !== null) {
+    return known
+  }
+
   // 1. Strict format parsing.
   let block: MarabuBlockObject
   try {
     block = BlockSchema.parse(blockRaw)
   } catch (e: any) {
     return fail('INVALID_FORMAT', `Block has invalid format: ${e.message}`)
-  }
-
-  // 2. Hash the block.
-  const blockid = hash(blockRaw)
-  if (blockid === undefined) {
-    return fail('INVALID_FORMAT', 'Block is not canonicalizable')
-  }
-
-  // Short circuit: we have already validated this block.
-  if (await hasHeight(blockid)) {
-    const height = (await loadHeight(blockid))!
-    const utxoSet = await loadUTXO(blockid)
-    return { valid: true, blockid, height, utxoSet: utxoSet ?? new UTXOSet() }
   }
 
   // Cycle protection (PoW makes this practically impossible, but be safe).
@@ -148,43 +147,45 @@ async function validateAndStoreBlockInner(
     return fail('INVALID_BLOCK_TIMESTAMP', `Block timestamp ${block.created} is in the future (now=${now})`)
   }
 
-  // 7. Recursive parent validation.
-  let parentRaw: any | null = null
+  // 7. Parent validation. A locally validated parent is a trusted blocktree
+  // anchor; otherwise fetch and recursively validate it.
+  let parentRaw: any | null = await objectManager.getRaw(block.previd)
+  let parentResult = await loadValidatedBlockState(block.previd)
 
-  // Try local DB first.
-  const parentObj = await objectManager.get(block.previd)
-  if (parentObj !== undefined && parentObj.type === 'block') {
-    parentRaw = parentObj
-  }
-  if (parentRaw === null) {
-    parentRaw = await fetchObject(block.previd)
-  }
-  if (parentRaw === null) {
+  if (parentResult === null) {
+    if (parentRaw === undefined) {
+      parentRaw = await fetchObject(block.previd)
+    }
+    if (parentRaw === null || parentRaw === undefined) {
+      return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} not available`)
+    }
+
+    // Hash check on the fetched parent.
+    const fetchedId = hash(parentRaw)
+    if (fetchedId !== block.previd) {
+      return fail('UNFINDABLE_OBJECT', `Fetched parent has wrong id ${fetchedId}, expected ${block.previd}`)
+    }
+
+    const recursiveResult = await validateAndStoreBlock(parentRaw, fetchObject, visited)
+    if (!recursiveResult.valid) {
+      // Propagate the parent's specific error code so the grader receives the right error.
+      // E.g. if parent has INVALID_GENESIS, the child also signals INVALID_GENESIS.
+      return fail(recursiveResult.error, `Parent block ${block.previd} is invalid: ${recursiveResult.description}`)
+    }
+    parentResult = recursiveResult
+  } else if (parentRaw === undefined || parentRaw === null) {
     return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} not available`)
   }
 
-  // Hash check on the fetched parent.
-  const fetchedId = hash(parentRaw)
-  if (fetchedId !== block.previd) {
-    return fail('UNFINDABLE_OBJECT', `Fetched parent has wrong id ${fetchedId}, expected ${block.previd}`)
-  }
-
-  const parentResult = await validateAndStoreBlock(parentRaw, fetchObject, visited)
-  if (!parentResult.valid) {
-    // Propagate the parent's specific error code so the grader receives the right error.
-    // E.g. if parent has INVALID_GENESIS, the child also signals INVALID_GENESIS.
-    return fail(parentResult.error, `Parent block ${block.previd} is invalid: ${parentResult.description}`)
-  }
-
   // 8. Timestamp must be strictly greater than the parent's.
-  // The parent block must be in the DB now (validateAndStoreBlock stored it).
-  const parentBlock = await objectManager.get(block.previd)
-  if (parentBlock === undefined || parentBlock.type !== 'block') {
-    return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} disappeared after validation`)
+  // The parent block must be in the DB now, either as a trusted local anchor or
+  // because validateAndStoreBlock stored it.
+  if (!isRawBlockLike(parentRaw)) {
+    return fail('UNFINDABLE_OBJECT', `Parent block ${block.previd} is not available as a block`)
   }
-  if (block.created <= parentBlock.created) {
+  if (block.created <= parentRaw.created) {
     return fail('INVALID_BLOCK_TIMESTAMP',
-      `Block timestamp ${block.created} is not greater than parent ${parentBlock.created}`)
+      `Block timestamp ${block.created} is not greater than parent ${parentRaw.created}`)
   }
 
   const parentHeight = parentResult.height
@@ -336,6 +337,22 @@ async function validateAndStoreBlockInner(
 
   log.info(`Block ${blockid} validated (height ${blockHeight}, ${transactions.length} txs)`)
   return { valid: true, blockid, height: blockHeight, utxoSet }
+}
+
+async function loadValidatedBlockState(blockid: string): Promise<BlockValidationOk | null> {
+  const height = await loadHeight(blockid)
+  if (height === null) return null
+  const utxoSet = await loadUTXO(blockid)
+  if (utxoSet === null) return null
+  return { valid: true, blockid, height, utxoSet }
+}
+
+function isRawBlockLike(obj: any): obj is { type: 'block', created: number } {
+  return obj !== null
+    && obj !== undefined
+    && obj.type === 'block'
+    && typeof obj.created === 'number'
+    && Number.isInteger(obj.created)
 }
 
 /**
