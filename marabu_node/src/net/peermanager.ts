@@ -337,6 +337,12 @@ export class PeerManager {
 
     return new MarabuPeer(client, this, true)
   }
+  broadcastIHaveObject(objectid: string) {
+    for (const peer of this.connections) {
+      if (peer.socket.destroyed || peer.socket.readyState !== 'open') continue
+      peer.sendIHaveObject(objectid)
+    }
+  }
   save() {
     log.debug(`Persisting ${this.knownPeerAddrs.size} peers to file`)
     const json: string = canonicalize(Array.from(this.knownPeerAddrs))!

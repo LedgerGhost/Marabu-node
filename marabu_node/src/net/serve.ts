@@ -6,6 +6,7 @@ import { PeerManager } from './peermanager'
 import { hash, objectManager } from '../objectmanager'
 import { UTXOSet, saveUTXO, hasUTXO, saveHeight, hasHeight } from '../utxo'
 import { getChainTip, setChainTip } from '../chain'
+import { startMiner } from '../miner'
 
 const GENESIS_BLOCK = {
   T: '00000000abc00000000000000000000000000000000000000000000000000000',
@@ -62,4 +63,5 @@ export async function run() {
   log.info(`Listening for connections on ${conf.SERVER_HOST}:${conf.SERVER_PORT}`)
 
   await peerManager.connectSufficiently()
+  startMiner(peerManager)
 }
