@@ -2,18 +2,77 @@ import { type MarabuError } from './net/protocol'
 import {
   type Transaction,
   type RegularTransaction,
+  type Output,
+  type Outpoint,
   isCoinbase,
   parseApplicationObject
 } from './objects'
 import { verifySignature } from './crypto'
 import { objectManager } from './objectmanager'
 import canonicalize from 'canonicalize'
-import { log } from './log'
+import { type UTXOSet } from './utxo'
 
+type OutpointResolution =
+  | { valid: true, output: Output }
+  | { valid: false, error: MarabuError, description: string }
+
+type OutpointResolver = (outpoint: Outpoint) => Promise<OutpointResolution>
 
 // Validate a tx object and return [valid, error, description].
 export async function validate(
   tx: any
+): Promise<[boolean, MarabuError | undefined, string | undefined]> {
+  return await validateWithOutpointResolver(tx, async (outpoint) => {
+    const refObj = await objectManager.get(outpoint.txid)
+    if (refObj === undefined) {
+      return {
+        valid: false,
+        error: 'UNKNOWN_OBJECT',
+        description: `Transaction ${outpoint.txid} referenced by outpoint not found`
+      }
+    }
+
+    if (refObj.type !== 'transaction') {
+      return {
+        valid: false,
+        error: 'INVALID_FORMAT',
+        description: `Outpoint references non-transaction object ${outpoint.txid}`
+      }
+    }
+
+    const refTx = refObj as Transaction
+    if (outpoint.index >= refTx.outputs.length) {
+      return {
+        valid: false,
+        error: 'INVALID_TX_OUTPOINT',
+        description: `Outpoint index ${outpoint.index} out of range`
+      }
+    }
+
+    return { valid: true, output: refTx.outputs[outpoint.index]! }
+  })
+}
+
+export async function validateAgainstUTXOSet(
+  tx: any,
+  utxoSet: UTXOSet
+): Promise<[boolean, MarabuError | undefined, string | undefined]> {
+  return await validateWithOutpointResolver(tx, async (outpoint) => {
+    const entry = utxoSet.get(outpoint.txid, outpoint.index)
+    if (entry === undefined) {
+      return {
+        valid: false,
+        error: 'INVALID_TX_OUTPOINT',
+        description: `Input ${outpoint.txid}:${outpoint.index} is not spendable`
+      }
+    }
+    return { valid: true, output: entry }
+  })
+}
+
+async function validateWithOutpointResolver(
+  tx: any,
+  resolveOutpoint: OutpointResolver
 ): Promise<[boolean, MarabuError | undefined, string | undefined]> {
   let parsed: Transaction
   try {
@@ -46,24 +105,10 @@ export async function validate(
   for (const input of regular.inputs) {
     const { outpoint, sig } = input
 
-    // Look up referenced transaction
-    const refObj = await objectManager.get(outpoint.txid)
-    if (refObj === undefined) {
-      return [false, 'UNKNOWN_OBJECT', `Transaction ${outpoint.txid} referenced by outpoint not found`]
+    const resolved = await resolveOutpoint(outpoint)
+    if (!resolved.valid) {
+      return [false, resolved.error, resolved.description]
     }
-
-    if (refObj.type !== 'transaction') {
-      return [false, 'INVALID_FORMAT', `Outpoint references non-transaction object ${outpoint.txid}`]
-    }
-
-    const refTx = refObj as Transaction
-
-    // Validate outpoint index
-    if (outpoint.index >= refTx.outputs.length) {
-      return [false, 'INVALID_TX_OUTPOINT', `Outpoint index ${outpoint.index} out of range`]
-    }
-
-    const referencedOutput = refTx.outputs[outpoint.index]!
 
     // Verify signature
     if (sig === null) {
@@ -82,11 +127,11 @@ export async function validate(
       return [false, 'INVALID_FORMAT', 'Failed to canonicalize transaction for signing']
     }
 
-    if (!verifySignature(sig, signingMessage, referencedOutput.pubkey)) {
+    if (!verifySignature(sig, signingMessage, resolved.output.pubkey)) {
       return [false, 'INVALID_TX_SIGNATURE', `Invalid signature for input ${outpoint.txid}:${outpoint.index}`]
     }
 
-    inputSum += referencedOutput.value
+    inputSum += resolved.output.value
   }
 
   // Conservation law

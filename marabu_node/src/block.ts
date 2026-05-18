@@ -1,5 +1,5 @@
 import { hash, objectManager } from './objectmanager'
-import { validate as validateTx } from './tx'
+import { validate as validateTx, validateAgainstUTXOSet } from './tx'
 import { type MarabuBlockObject, type MarabuTxObject, type MarabuError } from './net/protocol'
 import {
   type CoinbaseTransaction,
@@ -294,7 +294,7 @@ async function validateAndStoreBlockInner(
       inputSum += entry.value
     }
 
-    const [valid, err, desc] = await validateTx(tx)
+    const [valid, err, desc] = await validateAgainstUTXOSet(tx, utxoSet)
     if (!valid && err !== undefined && desc !== undefined) {
       if (err === 'INVALID_TX_SIGNATURE'
         || err === 'INVALID_TX_CONSERVATION'

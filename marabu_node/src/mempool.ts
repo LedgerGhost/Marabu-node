@@ -3,7 +3,7 @@ import { type RegularTransaction, isCoinbase } from './objects'
 import { getChainTip } from './chain'
 import { loadUTXO, UTXOSet } from './utxo'
 import { objectManager } from './objectmanager'
-import { validate as validateTx } from './tx'
+import { validateAgainstUTXOSet } from './tx'
 import { log } from './log'
 
 type MempoolResult =
@@ -113,7 +113,7 @@ async function applyTransactionToView(
     return fail('INVALID_TX_OUTPOINT', 'Coinbase transactions are not valid mempool transactions')
   }
 
-  const [valid, err, desc] = await validateTx(tx)
+  const [valid, err, desc] = await validateAgainstUTXOSet(tx, view)
   if (!valid) {
     return fail(err ?? 'INVALID_FORMAT', desc ?? 'Transaction is invalid')
   }

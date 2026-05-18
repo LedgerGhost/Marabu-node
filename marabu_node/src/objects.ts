@@ -1,7 +1,8 @@
 import * as z from 'zod'
 
-// A 32-byte hex string 64hex chars
+// A 32-byte hex string 64 hex chars
 const Hex32 = z.string().regex(/^[0-9a-f]{64}$/)
+const HexString = z.string().regex(/^[0-9a-f]+$/)
 // A 64-byte hex string 128 hex chars for Ed25519 
 const Hex64 = z.string().regex(/^[0-9a-f]{128}$/)
 
@@ -53,7 +54,7 @@ const AsciiPrintable128 = z.string().max(128).regex(/^[\x20-\x7e]*$/)
 export const BlockSchema = z.strictObject({
   type: z.literal('block'),
   txids: z.array(Hex32),
-  nonce: Hex32,
+  nonce: HexString,
   previd: z.union([Hex32, z.null()]),
   created: z.number().int().nonnegative(),
   T: Hex32,

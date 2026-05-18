@@ -296,13 +296,15 @@ export class MarabuPeer extends Peer {
     await this.handleBlockObject(obj as MarabuBlockObject, objectid)
   }
   private async handleTransactionObject(tx: MarabuTxObject, objectid: string) {
-    const [_, err, desc] = await validateObject(tx)
-    if (err !== undefined && desc !== undefined) {
-      this.sendError(err, desc)
+    const [objectValid, err, desc] = await validateObject(tx)
+    const mempoolResult = await addTransactionToMempool(objectid, tx)
+
+    if (!objectValid && !mempoolResult.valid) {
+      this.sendError(err ?? mempoolResult.error, desc ?? mempoolResult.description)
       return
     }
+
     await objectManager.put(tx)
-    const mempoolResult = await addTransactionToMempool(objectid, tx)
     if (!mempoolResult.valid) {
       this.sendError(mempoolResult.error, mempoolResult.description)
     }
