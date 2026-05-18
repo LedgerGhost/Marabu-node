@@ -31,7 +31,7 @@ import { loadHeight } from '../utxo'
 import {
   addTransactionToMempool,
   getMempoolTxids,
-  rebuildMempool
+  requestMempoolRebuild
 } from '../mempool'
 
 const PROTOCOL_VERSION = '0.10.0'
@@ -44,6 +44,7 @@ export class MarabuPeer extends Peer {
   handshook = false
   peerManager: PeerManager
   private chainTipPoll: ReturnType<typeof setInterval> | undefined
+  private requestedObjectIds = new Set<string>()
 
   constructor(socket: Socket, peerManager: PeerManager, private readonly outbound = false) {
     super(socket)
@@ -206,6 +207,7 @@ export class MarabuPeer extends Peer {
       return this.error('Received unhashable object', 'INVALID_FORMAT')
     }
 
+    const wasRequestedByUs = this.requestedObjectIds.delete(objectid)
     this.peerManager.noteObjectSource(objectid, this)
     const wasAlreadyProcessing = this.peerManager.isObjectProcessing(objectid)
     if (!wasAlreadyProcessing) {
@@ -227,7 +229,7 @@ export class MarabuPeer extends Peer {
       if (!wasAlreadyProcessing) {
         this.peerManager.finishObjectProcessing(objectid, object)
       }
-      this.gossipIHaveObject(objectid)
+      this.gossipIHaveObject(objectid, !wasRequestedByUs)
       return
     }
 
@@ -237,9 +239,9 @@ export class MarabuPeer extends Peer {
 
     try {
       if (object.type === 'block') {
-        await this.handleBlockObject(object as MarabuBlockObject, objectid)
+        await this.handleBlockObject(object as MarabuBlockObject, objectid, !wasRequestedByUs)
       } else {
-        await this.handleTransactionObject(object as MarabuTxObject, objectid)
+        await this.handleTransactionObject(object as MarabuTxObject, objectid, !wasRequestedByUs)
       }
     } finally {
       if (!wasAlreadyProcessing) {
@@ -250,7 +252,10 @@ export class MarabuPeer extends Peer {
   }
   @handle('getmempool')
   async handleGetMempool(_: GetMempoolMessage) {
-    await rebuildMempool()
+    const rebuild = requestMempoolRebuild()
+    const timeout = new Promise<void>((resolve) => setTimeout(resolve, 1000))
+    await Promise.race([rebuild, timeout])
+    rebuild.catch(err => this.log.warn(`Background mempool rebuild failed: ${err?.message ?? err}`))
     this.sendMessage({ type: 'mempool', txids: getMempoolTxids() } satisfies MempoolMessage)
   }
   @handle('mempool')
@@ -293,9 +298,9 @@ export class MarabuPeer extends Peer {
     }
     const objectid = hash(obj)
     if (objectid === undefined) return
-    await this.handleBlockObject(obj as MarabuBlockObject, objectid)
+    await this.handleBlockObject(obj as MarabuBlockObject, objectid, false)
   }
-  private async handleTransactionObject(tx: MarabuTxObject, objectid: string) {
+  private async handleTransactionObject(tx: MarabuTxObject, objectid: string, includeSender = true) {
     const [objectValid, err, desc] = await validateObject(tx)
     const mempoolResult = await addTransactionToMempool(objectid, tx)
 
@@ -308,9 +313,9 @@ export class MarabuPeer extends Peer {
     if (!mempoolResult.valid) {
       this.sendError(mempoolResult.error, mempoolResult.description)
     }
-    this.gossipIHaveObject(objectid)
+    this.gossipIHaveObject(objectid, includeSender)
   }
-  private async handleBlockObject(blockRaw: MarabuBlockObject, blockid: string) {
+  private async handleBlockObject(blockRaw: MarabuBlockObject, blockid: string, includeSender = true) {
     this.log.info(`Processing block ${blockid}`)
 
     // Per pset3: format + target + PoW must be checked BEFORE going to
@@ -354,20 +359,22 @@ export class MarabuPeer extends Peer {
     const tipChanged = await maybeUpdateChainTip(result.blockid)
     if (tipChanged) {
       const disconnectedTxids = await getDisconnectedTxids(oldTip?.blockid ?? null, result.blockid)
-      await rebuildMempool(disconnectedTxids)
+      void requestMempoolRebuild(disconnectedTxids)
     }
-    this.gossipIHaveObject(blockid)
+    this.gossipIHaveObject(blockid, includeSender)
   }
   /**
    * Broadcast an ihaveobject for a known good object to all peers.
    */
-  private gossipIHaveObject(objectid: string) {
+  private gossipIHaveObject(objectid: string, includeSender: boolean) {
     for (const peer of this.peerManager.connections) {
       if (peer === this) continue
       peer.sendIHaveObject(objectid)
     }
     // Also advertise back to the sender.
-    this.sendIHaveObject(objectid)
+    if (includeSender) {
+      this.sendIHaveObject(objectid)
+    }
   }
   /**
    * Request a single object from peers, deduplicating concurrent requests
@@ -397,6 +404,7 @@ export class MarabuPeer extends Peer {
     this.sendMessage({ type: 'ihaveobject', objectid } satisfies IHaveObjectMessage)
   }
   sendGetObject(objectid: string) {
+    this.requestedObjectIds.add(objectid)
     this.sendMessage({ type: 'getobject', objectid } satisfies GetObjectMessage)
   }
   sendObject(object: MarabuObject) {

@@ -14,17 +14,15 @@ export interface ChainTip {
 export async function getChainTip(): Promise<ChainTip | null> {
   const current = await loadStoredChainTip()
   const currentValid = current !== null
-    ? await isLocallyValidatedChainAtHeight(current.blockid, current.height)
+    ? await isLocallyValidatedBlockAtHeight(current.blockid, current.height)
     : false
 
-  const best = await getBestKnownChainTip(currentValid ? current!.height : -1)
-  if (best !== null) {
-    await setChainTip(best.blockid, best.height)
-    return best
-  }
-
   if (currentValid) return current
-  return null
+
+  const best = await getBestKnownChainTip(-1)
+  if (best === null) return null
+  await setChainTip(best.blockid, best.height)
+  return best
 }
 
 export async function setChainTip(blockid: string, height: number): Promise<void> {
@@ -39,7 +37,7 @@ export async function maybeUpdateChainTip(blockid: string): Promise<boolean> {
   if (height === null) return false
   const current = await loadStoredChainTip()
   if (current !== null && current.height >= height) return false
-  if (!await isLocallyValidatedChainAtHeight(blockid, height)) return false
+  if (!await isLocallyValidatedBlockAtHeight(blockid, height)) return false
 
   if (current === null || height > current.height) {
     await setChainTip(blockid, height)
@@ -106,13 +104,19 @@ async function getBestKnownChainTip(minHeightExclusive: number): Promise<ChainTi
 
   for (const candidate of heights) {
     if (candidate.height <= minHeightExclusive) return null
-    if (!await isLocallyValidatedChainAtHeight(candidate.blockid, candidate.height)) {
+    if (!await isLocallyValidatedBlockAtHeight(candidate.blockid, candidate.height)) {
       log.warn(`Ignoring invalid chain tip candidate ${candidate.blockid} at height ${candidate.height}`)
       continue
     }
     return candidate
   }
   return null
+}
+
+async function isLocallyValidatedBlockAtHeight(blockid: string, height: number): Promise<boolean> {
+  return await loadHeight(blockid) === height
+    && await loadUTXO(blockid) !== null
+    && await loadStoredBlockInfo(blockid) !== null
 }
 
 async function isLocallyValidatedChainAtHeight(blockid: string, height: number): Promise<boolean> {

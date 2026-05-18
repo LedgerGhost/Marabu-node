@@ -11,6 +11,8 @@ type MempoolResult =
   | { valid: false, error: MarabuError, description: string }
 
 const mempoolTxids = new Set<string>()
+const pendingRebuildCandidates = new Set<string>()
+let rebuildInFlight: Promise<void> | null = null
 
 function fail(error: MarabuError, description: string): MempoolResult {
   return { valid: false, error, description }
@@ -56,7 +58,7 @@ export async function rebuildMempool(extraCandidates: string[] = []): Promise<vo
   ])
 
   const view = base.clone()
-  mempoolTxids.clear()
+  const rebuiltTxids = new Set<string>()
 
   let remaining = Array.from(candidates)
   let progressed = true
@@ -72,7 +74,7 @@ export async function rebuildMempool(extraCandidates: string[] = []): Promise<vo
 
       const result = await applyTransactionToView(txid, obj, view)
       if (result.valid) {
-        mempoolTxids.add(txid)
+        rebuiltTxids.add(txid)
         progressed = true
       } else if (result.error === 'INVALID_TX_OUTPOINT') {
         nextRemaining.push(txid)
@@ -83,6 +85,39 @@ export async function rebuildMempool(extraCandidates: string[] = []): Promise<vo
 
     remaining = nextRemaining
   }
+
+  mempoolTxids.clear()
+  for (const txid of rebuiltTxids) {
+    mempoolTxids.add(txid)
+  }
+}
+
+export function requestMempoolRebuild(extraCandidates: string[] = []): Promise<void> {
+  for (const txid of extraCandidates) {
+    pendingRebuildCandidates.add(txid)
+  }
+
+  if (rebuildInFlight !== null) {
+    return rebuildInFlight
+  }
+
+  rebuildInFlight = (async () => {
+    try {
+      while (pendingRebuildCandidates.size > 0) {
+        const candidates = Array.from(pendingRebuildCandidates)
+        pendingRebuildCandidates.clear()
+        await rebuildMempool(candidates)
+      }
+      await rebuildMempool()
+    } finally {
+      rebuildInFlight = null
+      if (pendingRebuildCandidates.size > 0) {
+        void requestMempoolRebuild()
+      }
+    }
+  })()
+
+  return rebuildInFlight
 }
 
 async function buildSpendableView(txids: string[]): Promise<UTXOSet | null> {
