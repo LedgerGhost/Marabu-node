@@ -25,15 +25,14 @@ export function getMempoolTxids(): string[] {
 
 export async function addTransactionToMempool(
   txid: string,
-  tx: MarabuTxObject,
-  baseBlockid?: string
+  tx: MarabuTxObject
 ): Promise<MempoolResult> {
   if (!isCoinbase(tx)) {
     candidateTxids.add(txid)
   }
 
   const accepted = Array.from(mempoolTxids).filter(existing => existing !== txid)
-  const view = await buildSpendableView(accepted, baseBlockid)
+  const view = await buildSpendableView(accepted)
   if (view === null) {
     mempoolTxids.delete(txid)
     return fail('UNKNOWN_OBJECT', 'No current chain tip UTXO is available')
@@ -48,14 +47,14 @@ export async function addTransactionToMempool(
   return result
 }
 
-export async function rebuildMempool(extraCandidates: string[] = [], baseBlockid?: string): Promise<void> {
-  const resolvedBaseBlockid = baseBlockid ?? (await getChainTip())?.blockid
-  if (resolvedBaseBlockid === undefined) {
+export async function rebuildMempool(extraCandidates: string[] = []): Promise<void> {
+  const tip = await getChainTip()
+  if (tip === null) {
     mempoolTxids.clear()
     return
   }
 
-  const base = await loadUTXO(resolvedBaseBlockid)
+  const base = await loadUTXO(tip.blockid)
   if (base === null) {
     mempoolTxids.clear()
     return
@@ -130,11 +129,11 @@ export function requestMempoolRebuild(extraCandidates: string[] = []): Promise<v
   return rebuildInFlight
 }
 
-async function buildSpendableView(txids: string[], baseBlockid?: string): Promise<UTXOSet | null> {
-  const resolvedBaseBlockid = baseBlockid ?? (await getChainTip())?.blockid
-  if (resolvedBaseBlockid === undefined) return null
+async function buildSpendableView(txids: string[]): Promise<UTXOSet | null> {
+  const tip = await getChainTip()
+  if (tip === null) return null
 
-  const base = await loadUTXO(resolvedBaseBlockid)
+  const base = await loadUTXO(tip.blockid)
   if (base === null) return null
 
   const view = base.clone()

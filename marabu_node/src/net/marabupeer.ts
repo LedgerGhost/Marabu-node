@@ -31,7 +31,6 @@ import { loadHeight } from '../utxo'
 import {
   addTransactionToMempool,
   getMempoolTxids,
-  rebuildMempool,
   requestMempoolRebuild
 } from '../mempool'
 
@@ -46,7 +45,6 @@ export class MarabuPeer extends Peer {
   peerManager: PeerManager
   private chainTipPoll: ReturnType<typeof setInterval> | undefined
   private requestedObjectIds = new Set<string>()
-  private lastAcceptedBlockid: string | undefined
 
   constructor(socket: Socket, peerManager: PeerManager, private readonly outbound = false) {
     super(socket)
@@ -227,9 +225,6 @@ export class MarabuPeer extends Peer {
     if (alreadyStored && storedBlockHasHeight) {
       // Already known and previously accepted as valid.
       this.log.debug(`Already known object ${objectid}; gossiping`)
-      if (object.type === 'block') {
-        this.lastAcceptedBlockid = objectid
-      }
       this.peerManager.notifyObjectWaiters(objectid, object)
       if (!wasAlreadyProcessing) {
         this.peerManager.finishObjectProcessing(objectid, object)
@@ -259,9 +254,7 @@ export class MarabuPeer extends Peer {
   }
   @handle('getmempool')
   async handleGetMempool(_: GetMempoolMessage) {
-    const rebuild = this.lastAcceptedBlockid !== undefined
-      ? rebuildMempool([], this.lastAcceptedBlockid)
-      : requestMempoolRebuild()
+    const rebuild = requestMempoolRebuild()
     const timeout = new Promise<void>((resolve) => setTimeout(resolve, 1000))
     await Promise.race([rebuild, timeout])
     rebuild.catch(err => this.log.warn(`Background mempool rebuild failed: ${err?.message ?? err}`))
@@ -316,7 +309,7 @@ export class MarabuPeer extends Peer {
     shouldGossip = true
   ) {
     const [objectValid, err, desc] = await validateObject(tx)
-    const mempoolResult = await addTransactionToMempool(objectid, tx, this.lastAcceptedBlockid)
+    const mempoolResult = await addTransactionToMempool(objectid, tx)
 
     if (!objectValid && !mempoolResult.valid) {
       this.sendError(err ?? mempoolResult.error, desc ?? mempoolResult.description)
@@ -376,7 +369,6 @@ export class MarabuPeer extends Peer {
     if (storedBlock !== undefined) {
       this.peerManager.notifyObjectWaiters(result.blockid, storedBlock)
     }
-    this.lastAcceptedBlockid = result.blockid
 
     const tipChanged = await maybeUpdateChainTip(result.blockid)
     if (tipChanged) {
