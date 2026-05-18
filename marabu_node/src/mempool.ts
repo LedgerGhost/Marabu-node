@@ -11,6 +11,7 @@ type MempoolResult =
   | { valid: false, error: MarabuError, description: string }
 
 const mempoolTxids = new Set<string>()
+const candidateTxids = new Set<string>()
 const pendingRebuildCandidates = new Set<string>()
 let rebuildInFlight: Promise<void> | null = null
 
@@ -27,6 +28,10 @@ export async function addTransactionToMempool(
   tx: MarabuTxObject,
   baseBlockid?: string
 ): Promise<MempoolResult> {
+  if (!isCoinbase(tx)) {
+    candidateTxids.add(txid)
+  }
+
   const accepted = Array.from(mempoolTxids).filter(existing => existing !== txid)
   const view = await buildSpendableView(accepted, baseBlockid)
   if (view === null) {
@@ -58,6 +63,7 @@ export async function rebuildMempool(extraCandidates: string[] = [], baseBlockid
 
   const candidates = new Set<string>([
     ...mempoolTxids,
+    ...candidateTxids,
     ...extraCandidates
   ])
 

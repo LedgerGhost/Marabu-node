@@ -234,7 +234,9 @@ export class MarabuPeer extends Peer {
       if (!wasAlreadyProcessing) {
         this.peerManager.finishObjectProcessing(objectid, object)
       }
-      this.gossipIHaveObject(objectid, !wasRequestedByUs)
+      if (!wasRequestedByUs) {
+        this.gossipIHaveObject(objectid, true)
+      }
       return
     }
 
@@ -244,9 +246,9 @@ export class MarabuPeer extends Peer {
 
     try {
       if (object.type === 'block') {
-        await this.handleBlockObject(object as MarabuBlockObject, objectid, !wasRequestedByUs)
+        await this.handleBlockObject(object as MarabuBlockObject, objectid, !wasRequestedByUs, !wasRequestedByUs)
       } else {
-        await this.handleTransactionObject(object as MarabuTxObject, objectid, !wasRequestedByUs)
+        await this.handleTransactionObject(object as MarabuTxObject, objectid, !wasRequestedByUs, !wasRequestedByUs)
       }
     } finally {
       if (!wasAlreadyProcessing) {
@@ -305,9 +307,14 @@ export class MarabuPeer extends Peer {
     }
     const objectid = hash(obj)
     if (objectid === undefined) return
-    await this.handleBlockObject(obj as MarabuBlockObject, objectid, false)
+    await this.handleBlockObject(obj as MarabuBlockObject, objectid, false, false)
   }
-  private async handleTransactionObject(tx: MarabuTxObject, objectid: string, includeSender = true) {
+  private async handleTransactionObject(
+    tx: MarabuTxObject,
+    objectid: string,
+    includeSender = true,
+    shouldGossip = true
+  ) {
     const [objectValid, err, desc] = await validateObject(tx)
     const mempoolResult = await addTransactionToMempool(objectid, tx, this.lastAcceptedBlockid)
 
@@ -320,9 +327,16 @@ export class MarabuPeer extends Peer {
     if (!mempoolResult.valid) {
       this.sendError(mempoolResult.error, mempoolResult.description)
     }
-    this.gossipIHaveObject(objectid, includeSender)
+    if (shouldGossip) {
+      this.gossipIHaveObject(objectid, includeSender)
+    }
   }
-  private async handleBlockObject(blockRaw: MarabuBlockObject, blockid: string, includeSender = true) {
+  private async handleBlockObject(
+    blockRaw: MarabuBlockObject,
+    blockid: string,
+    includeSender = true,
+    shouldGossip = true
+  ) {
     this.log.info(`Processing block ${blockid}`)
 
     // Per pset3: format + target + PoW must be checked BEFORE going to
@@ -369,7 +383,9 @@ export class MarabuPeer extends Peer {
       const disconnectedTxids = await getDisconnectedTxids(oldTip?.blockid ?? null, result.blockid)
       void requestMempoolRebuild(disconnectedTxids)
     }
-    this.gossipIHaveObject(blockid, includeSender)
+    if (shouldGossip) {
+      this.gossipIHaveObject(blockid, includeSender)
+    }
   }
   /**
    * Broadcast an ihaveobject for a known good object to all peers.
