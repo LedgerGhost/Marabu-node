@@ -19,7 +19,7 @@ const ConfigSchema = z.object({
   SERVER_PORT: z.coerce.number().default(18018),
   AGENT_NAME: z.string().trim().max(128).default('LedgerGhost'),
   AGENT_VERSION: z.string().default('1.0.0'),
-  AGENT_AUTHOR: z.string().default('Stergiou Konstantinos <kstergiou987@gmail.com>'),
+  AGENT_AUTHOR: z.string().default('Konstantinos Stergiou'),
 
   IP_RETRIEVAL_SERVICE: z.url({ protocol: /^https$/ }).default('https://ifconfig.me/ip'),
   TARGET_NUM_CONNECTIONS: z.coerce.number().default(8),
